@@ -21,7 +21,8 @@ import org.apache.yetus.audience.InterfaceAudience;
 import org.apache.yetus.audience.InterfaceStability;
 
 /**
- * Operation to update columns on an existing row. Instances of this class should not be reused.
+ * Operation to update columns on an existing row.
+ * Instances of this class should not be reused.
  */
 @InterfaceAudience.Public
 @InterfaceStability.Evolving

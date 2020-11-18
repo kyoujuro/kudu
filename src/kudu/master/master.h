@@ -19,7 +19,6 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
-#include <string>
 #include <vector>
 
 #include "kudu/common/wire_protocol.pb.h"
@@ -37,6 +36,10 @@ class MaintenanceManager;
 class MonoDelta;
 class ThreadPool;
 
+namespace rpc {
+class RpcContext;
+}  // namespace rpc
+
 namespace master {
 class LocationCache;
 }  // namespace master
@@ -44,6 +47,10 @@ class LocationCache;
 namespace security {
 class TokenSigner;
 } // namespace security
+
+namespace transactions {
+class TxnManager;
+} // namespace transactions
 
 namespace master {
 
@@ -68,14 +75,13 @@ class Master : public kserver::KuduServer {
 
   Status StartAsync();
   Status WaitForCatalogManagerInit() const;
+  Status WaitForTxnManagerInit(const MonoDelta& timeout = {}) const;
 
   // Wait until this Master's catalog manager instance is the leader and is ready.
   // This method is intended for use by unit tests.
   // If 'timeout' time is exceeded, returns Status::TimedOut.
   Status WaitUntilCatalogManagerIsLeaderAndReadyForTests(const MonoDelta& timeout)
       WARN_UNUSED_RESULT;
-
-  const std::string& cluster_id() const { return cluster_id_; }
 
   MasterCertAuthority* cert_authority() { return cert_authority_.get(); }
 
@@ -84,6 +90,8 @@ class Master : public kserver::KuduServer {
   TSManager* ts_manager() { return ts_manager_.get(); }
 
   CatalogManager* catalog_manager() { return catalog_manager_.get(); }
+
+  transactions::TxnManager* txn_manager() { return txn_manager_.get(); }
 
   const MasterOptions& opts() { return opts_; }
 
@@ -104,20 +112,19 @@ class Master : public kserver::KuduServer {
   // request.
   Status ListMasters(std::vector<ServerEntryPB>* masters) const;
 
-  // Gets the HostPorts for all of the masters in the cluster.
+  // Gets the HostPorts for all of the VOTER masters in the cluster.
   // This is not as complete as ListMasters() above, but operates just
   // based on local state.
   Status GetMasterHostPorts(std::vector<HostPort>* hostports) const;
 
-  // Crash the master on disk error.
-  static void CrashMasterOnDiskError(const std::string& uuid);
-
-  // Crash the master on CFile corruption.
-  static void CrashMasterOnCFileCorruption(const std::string& tablet_id);
-
   bool IsShutdown() const {
     return state_ == kStopped;
   }
+
+  // Adds the master specified by 'hp' by initiating change config request.
+  // RpContext 'rpc' will be used to respond back to the client asynchronously.
+  // Returns the status of the master addition request.
+  Status AddMaster(const HostPort& hp, rpc::RpcContext* rpc);
 
   MaintenanceManager* maintenance_manager() {
     return maintenance_manager_.get();
@@ -126,9 +133,14 @@ class Master : public kserver::KuduServer {
  private:
   friend class MasterTest;
   friend class CatalogManager;
+  friend class transactions::TxnManager;
 
   void InitCatalogManagerTask();
   Status InitCatalogManager();
+
+  void InitTxnManagerTask();
+  Status InitTxnManager();
+  Status ScheduleTxnManagerInit();
 
   // Initialize registration_.
   // Requires that the web server and RPC server have been started.
@@ -139,29 +151,32 @@ class Master : public kserver::KuduServer {
   // safe in a particular case.
   void ShutdownImpl();
 
-  // Set the cluster ID on this master for fast lookup.
-  void set_cluster_id(const std::string& cluster_id) { cluster_id_ = cluster_id; }
-
   enum MasterState {
     kStopped,
     kInitialized,
-    kRunning
+    kRunning,
+    kStopping,
   };
 
   MasterState state_;
 
-  std::string cluster_id_ = "";
-
   std::unique_ptr<MasterCertAuthority> cert_authority_;
   std::unique_ptr<security::TokenSigner> token_signer_;
   std::unique_ptr<CatalogManager> catalog_manager_;
+  std::unique_ptr<transactions::TxnManager> txn_manager_;
   std::unique_ptr<MasterPathHandlers> path_handlers_;
 
-  // The status of the master initialization. This is set
+  // The status of the catalog manager initialization. This is set
   // by the async initialization task.
-  Promise<Status> init_status_;
+  Promise<Status> catalog_manager_init_status_;
 
-  // For initializing the catalog manager.
+  // The status of the TxnManager initialization. This is set by an asynchronous
+  // initialization task. The task to initialize TxnManager can be scheduled
+  // either by master upon its start or from within TxnManager itself while
+  // processing the very first RPC after start.
+  Promise<Status> txn_manager_init_status_;
+
+  // For initializing the catalog manager and TxnManager.
   std::unique_ptr<ThreadPool> init_pool_;
 
   MasterOptions opts_;

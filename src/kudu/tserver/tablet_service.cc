@@ -86,6 +86,7 @@
 #include "kudu/tablet/tablet_metrics.h"
 #include "kudu/tablet/tablet_replica.h"
 #include "kudu/tablet/txn_coordinator.h"
+#include "kudu/transactions/transactions.pb.h"
 #include "kudu/tserver/scanners.h"
 #include "kudu/tserver/tablet_replica_lookup.h"
 #include "kudu/tserver/tablet_server.h"
@@ -135,10 +136,12 @@ DEFINE_bool(scanner_allow_snapshot_scans_with_logical_timestamps, false,
 TAG_FLAG(scanner_allow_snapshot_scans_with_logical_timestamps, unsafe);
 
 DEFINE_int32(scanner_max_wait_ms, 1000,
-             "The maximum amount of time (in milliseconds) we'll hang a scanner thread waiting for "
-             "safe time to advance or ops to commit, even if its deadline allows waiting "
-             "longer.");
+             "The maximum amount of time (in milliseconds) a scan "
+             "at a snapshot is allowed to wait for safe time to advance "
+             "or pending write operations to apply, even if the deadline "
+             "of the scan request itself allows for waiting longer.");
 TAG_FLAG(scanner_max_wait_ms, advanced);
+TAG_FLAG(scanner_max_wait_ms, runtime);
 
 // Fault injection flags.
 DEFINE_int32(scanner_inject_latency_on_each_batch_ms, 0,
@@ -1194,6 +1197,7 @@ Status ValidateCoordinatorOpFields(const CoordinatorOpPB& op) {
     case CoordinatorOpPB::BEGIN_TXN:
     case CoordinatorOpPB::BEGIN_COMMIT_TXN:
     case CoordinatorOpPB::ABORT_TXN:
+    case CoordinatorOpPB::GET_TXN_STATUS:
       if (!op.has_txn_id()) {
         return Status::InvalidArgument(Substitute("Missing txn id: $0",
                                                   SecureShortDebugString(op)));
@@ -1244,11 +1248,14 @@ void TabletServiceAdminImpl::CoordinateTransaction(const CoordinateTransactionRe
   // Catch any replication errors in this 'ts_error' so we can return an
   // appropriate error to the caller if need be.
   TabletServerErrorPB ts_error;
+  transactions::TxnStatusEntryPB txn_status;
   const auto& user = op.user();
   const auto& txn_id = op.txn_id();
+  int64_t highest_seen_txn_id = -1;
   switch (op.type()) {
     case CoordinatorOpPB::BEGIN_TXN:
-      s = txn_coordinator->BeginTransaction(txn_id, user, &ts_error);
+      s = txn_coordinator->BeginTransaction(
+          txn_id, user, &highest_seen_txn_id, &ts_error);
       break;
     case CoordinatorOpPB::REGISTER_PARTICIPANT:
       s = txn_coordinator->RegisterParticipant(txn_id, op.txn_participant_id(), user, &ts_error);
@@ -1258,6 +1265,9 @@ void TabletServiceAdminImpl::CoordinateTransaction(const CoordinateTransactionRe
       break;
     case CoordinatorOpPB::ABORT_TXN:
       s = txn_coordinator->AbortTransaction(txn_id, user, &ts_error);
+      break;
+    case CoordinatorOpPB::GET_TXN_STATUS:
+      s = txn_coordinator->GetTransactionStatus(txn_id, user, &txn_status);
       break;
     default:
       s = Status::InvalidArgument(Substitute("Unknown op type: $0", op.type()));
@@ -1270,6 +1280,13 @@ void TabletServiceAdminImpl::CoordinateTransaction(const CoordinateTransactionRe
   // From here on out, errors are considered application errors.
   if (PREDICT_FALSE(!s.ok())) {
     StatusToPB(s, resp->mutable_op_result()->mutable_op_error());
+  } else if (op.type() == CoordinatorOpPB::GET_TXN_STATUS) {
+    // Populate corresponding field in the response.
+    *(resp->mutable_op_result()->mutable_txn_status()) = std::move(txn_status);
+  }
+  if (op.type() == CoordinatorOpPB::BEGIN_TXN && !s.IsServiceUnavailable()) {
+    DCHECK_GE(highest_seen_txn_id, 0);
+    resp->mutable_op_result()->set_highest_seen_txn_id(highest_seen_txn_id);
   }
   context->RespondSuccess();
 }
@@ -2640,6 +2657,9 @@ Status TabletServiceImpl::HandleNewScanRequest(TabletReplica* replica,
   }
 
   VLOG(3) << "Before optimizing scan spec: " << spec.ToString(tablet_schema);
+  spec.PruneHashForInlistIfPossible(tablet_schema,
+                                    replica->tablet_metadata()->partition(),
+                                    replica->tablet_metadata()->partition_schema());
   spec.OptimizeScan(tablet_schema, scanner->arena(), true);
   VLOG(3) << "After optimizing scan spec: " << spec.ToString(tablet_schema);
 
@@ -3035,7 +3055,7 @@ Status TabletServiceImpl::HandleContinueScanRequest(const ScanRequestPB* req,
 namespace {
 // Helper to clamp a client deadline for a scan to the max supported by the server.
 MonoTime ClampScanDeadlineForWait(const MonoTime& deadline, bool* was_clamped) {
-  MonoTime now = MonoTime::Now();
+  const MonoTime now = MonoTime::Now();
   if ((deadline - now).ToMilliseconds() > FLAGS_scanner_max_wait_ms) {
     *was_clamped = true;
     return now + MonoDelta::FromMilliseconds(FLAGS_scanner_max_wait_ms);
@@ -3054,12 +3074,30 @@ Status TabletServiceImpl::HandleScanAtSnapshot(const NewScanRequestPB& scan_pb,
                                                boost::optional<Timestamp>* snap_start_timestamp,
                                                Timestamp* snap_timestamp,
                                                TabletServerErrorPB::Code* error_code) {
-  switch (scan_pb.read_mode()) {
+  const auto read_mode = scan_pb.read_mode();
+  switch (read_mode) {
     case READ_AT_SNAPSHOT: // Fallthrough intended
     case READ_YOUR_WRITES:
       break;
     default:
-      LOG(FATAL) << "Unsupported snapshot scan mode specified.";
+      LOG(FATAL) << Substitute("$0: unsupported snapshot scan mode", read_mode);
+  }
+
+  // Validate other input parameters as well in the very beginning.
+  if (scan_pb.has_snap_start_timestamp()) {
+    if (read_mode != READ_AT_SNAPSHOT) {
+      // TODO(mpercy): Should we allow READ_YOUR_WRITES mode? There is no
+      // obvious use for it, but also no obvious reason not to support it,
+      // except for the fact that we would also have to test it.
+      *error_code = TabletServerErrorPB::INVALID_SCAN_SPEC;
+      return Status::InvalidArgument("scan start timestamp is only supported "
+                                     "in READ_AT_SNAPSHOT read mode");
+    }
+    if (scan_pb.order_mode() != ORDERED) {
+      *error_code = TabletServerErrorPB::INVALID_SCAN_SPEC;
+      return Status::InvalidArgument("scan start timestamp is only supported "
+                                     "in ORDERED order mode");
+    }
   }
 
   // Based on the read mode, pick a timestamp and verify it.
@@ -3071,7 +3109,8 @@ Status TabletServiceImpl::HandleScanAtSnapshot(const NewScanRequestPB& scan_pb,
   }
 
   // Reduce the client's deadline by a few msecs to allow for overhead.
-  MonoTime client_deadline = rpc_context->GetClientDeadline() - MonoDelta::FromMilliseconds(10);
+  const MonoTime client_deadline =
+      rpc_context->GetClientDeadline() - MonoDelta::FromMilliseconds(10);
 
   // Its not good for the tablet server or for the client if we hang here forever. The tablet
   // server will have one less available thread and the client might be stuck spending all
@@ -3088,7 +3127,7 @@ Status TabletServiceImpl::HandleScanAtSnapshot(const NewScanRequestPB& scan_pb,
   // snapshot to be clean below, allows us to always return the same data when scanning at
   // the same timestamp (repeatable reads).
   TRACE("Waiting safe time to advance");
-  MonoTime before = MonoTime::Now();
+  const MonoTime before = MonoTime::Now();
   s = time_manager->WaitUntilSafe(tmp_snap_timestamp, final_deadline);
 
   tablet::MvccSnapshot snap;
@@ -3099,16 +3138,16 @@ Status TabletServiceImpl::HandleScanAtSnapshot(const NewScanRequestPB& scan_pb,
           tmp_snap_timestamp, &snap, client_deadline);
   }
 
-  // If we got an TimeOut but we had clamped the deadline, return a ServiceUnavailable instead
-  // so that the client retries.
-  if (PREDICT_FALSE(s.IsTimedOut() && was_clamped)) {
+  // If we got an TimeOut but we had clamped the deadline, return
+  // ServiceUnavailable to make the client retry the scan operation soon.
+  if (s.IsTimedOut() && was_clamped) {
     *error_code = TabletServerErrorPB::THROTTLED;
     return Status::ServiceUnavailable(s.CloneAndPrepend(
         "could not wait for desired snapshot timestamp to be consistent").ToString());
   }
   RETURN_NOT_OK(s);
 
-  uint64_t duration_usec = (MonoTime::Now() - before).ToMicroseconds();
+  const auto duration_usec = (MonoTime::Now() - before).ToMicroseconds();
   tablet->metrics()->snapshot_read_inflight_wait_duration->Increment(duration_usec);
   TRACE("All operations in snapshot committed. Waited for $0 microseconds", duration_usec);
 
@@ -3119,19 +3158,6 @@ Status TabletServiceImpl::HandleScanAtSnapshot(const NewScanRequestPB& scan_pb,
 
   boost::optional<Timestamp> tmp_snap_start_timestamp;
   if (scan_pb.has_snap_start_timestamp()) {
-    if (scan_pb.read_mode() != READ_AT_SNAPSHOT) {
-      // TODO(mpercy): Should we allow READ_YOUR_WRITES mode? There is no
-      // obvious use for it, but also no obvious reason not to support it,
-      // except for the fact that we would also have to test it.
-      *error_code = TabletServerErrorPB::INVALID_SCAN_SPEC;
-      return Status::InvalidArgument("scan start timestamp is only supported "
-                                     "in READ_AT_SNAPSHOT read mode");
-    }
-    if (scan_pb.order_mode() != ORDERED) {
-      *error_code = TabletServerErrorPB::INVALID_SCAN_SPEC;
-      return Status::InvalidArgument("scan start timestamp is only supported "
-                                     "in ORDERED order mode");
-    }
     tmp_snap_start_timestamp = Timestamp(scan_pb.snap_start_timestamp());
     opts.snap_to_exclude = MvccSnapshot(*tmp_snap_start_timestamp);
     opts.include_deleted_rows = true;
@@ -3142,7 +3168,7 @@ Status TabletServiceImpl::HandleScanAtSnapshot(const NewScanRequestPB& scan_pb,
   // iterators are open but there is no point in doing the work to initialize
   // the iterators and spending the time to wait for a snapshot timestamp to be
   // readable when we can't read back to one of the requested timestamps.
-  RETURN_NOT_OK_EVAL(VerifyLegalSnapshotTimestamps(tablet, scan_pb.read_mode(),
+  RETURN_NOT_OK_EVAL(VerifyLegalSnapshotTimestamps(tablet, read_mode,
                                                    tmp_snap_start_timestamp,
                                                    tmp_snap_timestamp),
                      *error_code = TabletServerErrorPB::INVALID_SNAPSHOT);

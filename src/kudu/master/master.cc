@@ -44,6 +44,8 @@
 #include "kudu/master/master_path_handlers.h"
 #include "kudu/master/master_service.h"
 #include "kudu/master/ts_manager.h"
+#include "kudu/master/txn_manager.h"
+#include "kudu/master/txn_manager_service.h"
 #include "kudu/rpc/messenger.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/rpc/service_if.h"
@@ -53,6 +55,7 @@
 #include "kudu/tserver/tablet_copy_service.h"
 #include "kudu/tserver/tablet_service.h"
 #include "kudu/util/flag_tags.h"
+#include "kudu/util/logging.h"
 #include "kudu/util/maintenance_manager.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/net_util.h"
@@ -91,11 +94,15 @@ DEFINE_string(location_mapping_cmd, "",
               "characters from the set [a-zA-Z0-9_-.]. If the cluster is not "
               "using location awareness features this flag should not be set.");
 
+DECLARE_bool(txn_manager_lazily_initialized);
+DECLARE_bool(txn_manager_enabled);
 
 using kudu::consensus::RaftPeerPB;
 using kudu::fs::ErrorHandlerType;
 using kudu::rpc::ServiceIf;
 using kudu::security::TokenSigner;
+using kudu::transactions::TxnManager;
+using kudu::transactions::TxnManagerServiceImpl;
 using kudu::tserver::ConsensusServiceImpl;
 using kudu::tserver::TabletCopyServiceImpl;
 using std::min;
@@ -106,15 +113,68 @@ using std::vector;
 using strings::Substitute;
 
 namespace kudu {
+namespace rpc {
+class RpcContext;
+}  // namespace rpc
+}  // namespace kudu
+
+namespace kudu {
 namespace master {
 
+namespace {
+constexpr const char* kReplaceMasterMessage =
+    "this master may return incorrect results and should be replaced";
+void CrashMasterOnDiskError(const string& uuid) {
+  LOG(FATAL) << Substitute("Disk error detected on data directory $0: $1",
+                           uuid, kReplaceMasterMessage);
+}
+void CrashMasterOnCFileCorruption(const string& tablet_id) {
+  LOG(FATAL) << Substitute("CFile corruption detected on system catalog $0: $1",
+                           tablet_id, kReplaceMasterMessage);
+}
+void CrashMasterOnKudu2233Corruption(const string& tablet_id) {
+  LOG(FATAL) << Substitute("KUDU-2233 corruption detected on system catalog $0: $1 ",
+                           tablet_id, kReplaceMasterMessage);
+}
+
+// TODO(Alex Feinberg) this method should be moved to a separate class (along with
+// ListMasters), so that it can also be used in TS and client when
+// bootstrapping.
+Status GetMasterEntryForHost(const shared_ptr<rpc::Messenger>& messenger,
+                             const HostPort& hostport,
+                             ServerEntryPB* e) {
+  Sockaddr sockaddr;
+  RETURN_NOT_OK(SockaddrFromHostPort(hostport, &sockaddr));
+  MasterServiceProxy proxy(messenger, sockaddr, hostport.host());
+  GetMasterRegistrationRequestPB req;
+  GetMasterRegistrationResponsePB resp;
+  rpc::RpcController controller;
+  controller.set_timeout(MonoDelta::FromMilliseconds(FLAGS_master_registration_rpc_timeout_ms));
+  RETURN_NOT_OK(proxy.GetMasterRegistration(req, &resp, &controller));
+  e->mutable_instance_id()->CopyFrom(resp.instance_id());
+  if (resp.has_error()) {
+    return StatusFromPB(resp.error().status());
+  }
+  e->mutable_registration()->CopyFrom(resp.registration());
+  e->set_role(resp.role());
+  if (resp.has_cluster_id()) {
+    e->set_cluster_id(resp.cluster_id());
+  }
+  if (resp.has_member_type()) {
+    e->set_member_type(resp.member_type());
+  }
+  return Status::OK();
+}
+} // anonymous namespace
+
 Master::Master(const MasterOptions& opts)
-  : KuduServer("Master", opts, "kudu.master"),
-    state_(kStopped),
-    catalog_manager_(new CatalogManager(this)),
-    path_handlers_(new MasterPathHandlers(this)),
-    opts_(opts),
-    registration_initialized_(false) {
+    : KuduServer("Master", opts, "kudu.master"),
+      state_(kStopped),
+      catalog_manager_(new CatalogManager(this)),
+      txn_manager_(FLAGS_txn_manager_enabled ? new TxnManager(this) : nullptr),
+      path_handlers_(new MasterPathHandlers(this)),
+      opts_(opts),
+      registration_initialized_(false) {
   const auto& location_cmd = FLAGS_location_mapping_cmd;
   if (!location_cmd.empty()) {
     location_cache_.reset(new LocationCache(location_cmd, metric_entity_.get()));
@@ -170,6 +230,8 @@ Status Master::StartAsync() {
                                       &CrashMasterOnDiskError);
   fs_manager_->SetErrorNotificationCb(ErrorHandlerType::CFILE_CORRUPTION,
                                       &CrashMasterOnCFileCorruption);
+  fs_manager_->SetErrorNotificationCb(ErrorHandlerType::KUDU_2233_CORRUPTION,
+                                      &CrashMasterOnKudu2233Corruption);
 
   RETURN_NOT_OK(maintenance_manager_->Start());
 
@@ -178,17 +240,30 @@ Status Master::StartAsync() {
       new ConsensusServiceImpl(this, catalog_manager_.get()));
   unique_ptr<ServiceIf> tablet_copy_service(
       new TabletCopyServiceImpl(this, catalog_manager_.get()));
+  unique_ptr<ServiceIf> txn_manager_service(
+      txn_manager_ ? new TxnManagerServiceImpl(this) : nullptr);
 
   RETURN_NOT_OK(RegisterService(std::move(impl)));
   RETURN_NOT_OK(RegisterService(std::move(consensus_service)));
   RETURN_NOT_OK(RegisterService(std::move(tablet_copy_service)));
+  if (txn_manager_service) {
+    RETURN_NOT_OK(RegisterService(std::move(txn_manager_service)));
+  }
   RETURN_NOT_OK(KuduServer::Start());
 
   // Now that we've bound, construct our ServerRegistrationPB.
   RETURN_NOT_OK(InitMasterRegistration());
 
   // Start initializing the catalog manager.
-  RETURN_NOT_OK(init_pool_->Submit([this]() { this->InitCatalogManagerTask(); }));
+  RETURN_NOT_OK(init_pool_->Submit([this]() {
+    this->InitCatalogManagerTask();
+  }));
+
+  if (txn_manager_ && !FLAGS_txn_manager_lazily_initialized) {
+    // Start initializing the TxnManager.
+    RETURN_NOT_OK(ScheduleTxnManagerInit());
+  }
+
   state_ = kRunning;
 
   return Status::OK();
@@ -199,7 +274,7 @@ void Master::InitCatalogManagerTask() {
   if (!s.ok()) {
     LOG(ERROR) << "Unable to init master catalog manager: " << s.ToString();
   }
-  init_status_.Set(s);
+  catalog_manager_init_status_.Set(s);
 }
 
 Status Master::InitCatalogManager() {
@@ -213,8 +288,62 @@ Status Master::InitCatalogManager() {
 
 Status Master::WaitForCatalogManagerInit() const {
   CHECK_EQ(state_, kRunning);
+  return catalog_manager_init_status_.Get();
+}
 
-  return init_status_.Get();
+Status Master::ScheduleTxnManagerInit() {
+  DCHECK(txn_manager_);
+  return init_pool_->Submit([this]() { this->InitTxnManagerTask(); });
+}
+
+void Master::InitTxnManagerTask() {
+  DCHECK(txn_manager_);
+  // For successful TxnManager's initialization it's necessary to have enough
+  // tablet servers running in a Kudu cluster. Since Kudu master can be started
+  // up in environments where tablet servers start long after the master's
+  // startup, this task retries indefinitely to initialize TxnManager and
+  // make it ready to handle requests in case of non-lazy initialization mode
+  // (the latter is controlled by the --txn_manager_lazily_initialized flag).
+  Status s;
+  while (true) {
+    if (state_ == kStopping || state_ == kStopped) {
+      s = Status::Incomplete("shut down while trying to initialize TxnManager");
+      break;
+    }
+    s = InitTxnManager();
+    if (s.ok()) {
+      break;
+    }
+    // TODO(aserbin): if retrying every second looks too often, consider adding
+    //                exponential back-off and adding condition variables to
+    //                wake up a long-awaiting task and retry initialization
+    //                right away when TxnManager receives a call.
+    static const MonoDelta kRetryInterval = MonoDelta::FromSeconds(1);
+    KLOG_EVERY_N_SECS(WARNING, 60) << Substitute(
+        "$0: unable to init TxnManager, will retry in $1",
+        s.ToString(), kRetryInterval.ToString());
+    SleepFor(kRetryInterval);
+  }
+  txn_manager_init_status_.Set(s);
+}
+
+Status Master::InitTxnManager() {
+  if (!txn_manager_) {
+    return Status::IllegalState("TxnManager is not enabled");
+  }
+  RETURN_NOT_OK_PREPEND(txn_manager_->Init(), "unable to initialize TxnManager");
+  return Status::OK();
+}
+
+Status Master::WaitForTxnManagerInit(const MonoDelta& timeout) const {
+  CHECK_EQ(state_, kRunning);
+  if (timeout.Initialized()) {
+    const Status* s = txn_manager_init_status_.WaitFor(timeout);
+    if (!s) {
+      return Status::TimedOut("timed out waiting for TxnManager to initialize");
+    }
+  }
+  return txn_manager_init_status_.Get();
 }
 
 Status Master::WaitUntilCatalogManagerIsLeaderAndReadyForTests(const MonoDelta& timeout) {
@@ -272,6 +401,7 @@ void Master::ShutdownImpl() {
   if (kInitialized == state_ || kRunning == state_) {
     const string name = rpc_server_->ToString();
     LOG(INFO) << "Master@" << name << " shutting down...";
+    state_ = kStopping;
 
     // 1. Stop accepting new RPCs.
     UnregisterAllServices();
@@ -290,62 +420,28 @@ void Master::ShutdownImpl() {
   state_ = kStopped;
 }
 
-void Master::CrashMasterOnDiskError(const string& uuid) {
-  LOG(FATAL) << Substitute("Disk error detected on data directory $0", uuid);
-}
-
-void Master::CrashMasterOnCFileCorruption(const string& tablet_id) {
-  LOG(FATAL) << Substitute("CFile corruption detected on system catalog $0", tablet_id);
-}
-
-namespace {
-
-// TODO(Alex Feinberg) this method should be moved to a separate class (along with
-// ListMasters), so that it can also be used in TS and client when
-// bootstrapping.
-Status GetMasterEntryForHost(const shared_ptr<rpc::Messenger>& messenger,
-                             const HostPort& hostport,
-                             ServerEntryPB* e) {
-  Sockaddr sockaddr;
-  RETURN_NOT_OK(SockaddrFromHostPort(hostport, &sockaddr));
-  MasterServiceProxy proxy(messenger, sockaddr, hostport.host());
-  GetMasterRegistrationRequestPB req;
-  GetMasterRegistrationResponsePB resp;
-  rpc::RpcController controller;
-  controller.set_timeout(MonoDelta::FromMilliseconds(FLAGS_master_registration_rpc_timeout_ms));
-  RETURN_NOT_OK(proxy.GetMasterRegistration(req, &resp, &controller));
-  e->mutable_instance_id()->CopyFrom(resp.instance_id());
-  if (resp.has_error()) {
-    return StatusFromPB(resp.error().status());
-  }
-  e->mutable_registration()->CopyFrom(resp.registration());
-  e->set_role(resp.role());
-  if (resp.has_cluster_id()) {
-    e->set_cluster_id(resp.cluster_id());
-  }
-  return Status::OK();
-}
-
-} // anonymous namespace
-
 Status Master::ListMasters(vector<ServerEntryPB>* masters) const {
-  if (!opts_.IsDistributed()) {
-    ServerEntryPB local_entry;
-    local_entry.mutable_instance_id()->CopyFrom(catalog_manager_->NodeInstance());
-    RETURN_NOT_OK(GetMasterRegistration(local_entry.mutable_registration()));
-    local_entry.set_role(RaftPeerPB::LEADER);
-    local_entry.set_cluster_id(cluster_id_);
-    masters->emplace_back(std::move(local_entry));
-    return Status::OK();
-  }
-
   auto consensus = catalog_manager_->master_consensus();
   if (!consensus) {
     return Status::IllegalState("consensus not running");
   }
   const auto config = consensus->CommittedConfig();
-
   masters->clear();
+  DCHECK_GE(config.peers_size(), 1);
+  // Optimized code path that doesn't involve reaching out to other
+  // masters over network for single master configuration.
+  if (config.peers_size() == 1) {
+    ServerEntryPB local_entry;
+    local_entry.mutable_instance_id()->CopyFrom(catalog_manager_->NodeInstance());
+    RETURN_NOT_OK(GetMasterRegistration(local_entry.mutable_registration()));
+    local_entry.set_role(RaftPeerPB::LEADER);
+    local_entry.set_cluster_id(catalog_manager_->GetClusterId());
+    local_entry.set_member_type(RaftPeerPB::VOTER);
+    masters->emplace_back(std::move(local_entry));
+    return Status::OK();
+  }
+
+  // For distributed master configuration.
   for (const auto& peer : config.peers()) {
     HostPort hp = HostPortFromPB(peer.last_known_addr());
     ServerEntryPB peer_entry;
@@ -394,6 +490,26 @@ Status Master::GetMasterHostPorts(vector<HostPort>* hostports) const {
     }
   }
   return Status::OK();
+}
+
+Status Master::AddMaster(const HostPort& hp, rpc::RpcContext* rpc) {
+  // Ensure requested master to be added is not already part of list of masters.
+  vector<HostPort> masters;
+  // Here the check is made against committed config with voters only.
+  RETURN_NOT_OK(GetMasterHostPorts(&masters));
+  if (std::find(masters.begin(), masters.end(), hp) != masters.end()) {
+    return Status::AlreadyPresent("Master already present");
+  }
+
+  // Check whether the master to be added is reachable and fetch its uuid.
+  ServerEntryPB peer_entry;
+  RETURN_NOT_OK(GetMasterEntryForHost(messenger_, hp, &peer_entry));
+  const auto& peer_uuid = peer_entry.instance_id().permanent_uuid();
+
+  // No early validation for whether a config change is in progress.
+  // If it's in progress, on initiating config change Raft will return error.
+  return catalog_manager()->InitiateMasterChangeConfig(CatalogManager::kAddMaster, hp, peer_uuid,
+                                                       rpc);
 }
 
 } // namespace master

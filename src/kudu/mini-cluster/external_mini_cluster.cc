@@ -112,6 +112,7 @@ static double kMasterCatalogManagerTimeoutSeconds = 60.0;
 
 ExternalMiniClusterOptions::ExternalMiniClusterOptions()
     : num_masters(1),
+      supply_single_master_addr(false),
       num_tablet_servers(1),
       bind_mode(kDefaultBindMode),
       num_data_dirs(1),
@@ -498,7 +499,7 @@ Status ExternalMiniCluster::StartMasters() {
   // Setting --master_addresses flag for a single master configuration is now supported but not
   // mandatory. Not setting the flag helps test existing kudu deployments that don't specify
   // the --master_addresses flag for single master configuration.
-  if (num_masters > 1) {
+  if (num_masters > 1 || opts_.supply_single_master_addr) {
     flags.emplace_back(Substitute("--master_addresses=$0",
                                   HostPort::ToCommaSeparatedString(master_rpc_addrs)));
   }
@@ -923,6 +924,20 @@ string ExternalMiniCluster::UuidForTS(int ts_idx) const {
   return tablet_server(ts_idx)->uuid();
 }
 
+Status ExternalMiniCluster::AddMaster(const scoped_refptr<ExternalMaster>& new_master) {
+  const auto& new_master_uuid = new_master->instance_id().permanent_uuid();
+  for (const auto& m : masters_) {
+    if (m->instance_id().permanent_uuid() == new_master_uuid) {
+      CHECK(m->bound_rpc_hostport() == new_master->bound_rpc_hostport());
+      return Status::AlreadyPresent(Substitute(
+          "Master $0, uuid: $1 already present in ExternalMiniCluster",
+          m->bound_rpc_hostport().ToString(), new_master_uuid));
+    }
+  }
+  masters_.emplace_back(new_master);
+  return Status::OK();
+}
+
 //------------------------------------------------------------
 // ExternalDaemon
 //------------------------------------------------------------
@@ -960,20 +975,6 @@ Status ExternalDaemon::StartProcess(const vector<string>& user_flags) {
     // rely on forcefully cutting power to a machine or equivalent.
     "--never_fsync",
 
-    // Generate smaller RSA keys -- generating a 768-bit key is faster
-    // than generating the default 2048-bit key, and we don't care about
-    // strong encryption in tests. Setting it lower (e.g. 512 bits) results
-    // in OpenSSL errors RSA_sign:digest too big for rsa key:rsa_sign.c:122
-    // since we are using strong/high TLS v1.2 cipher suites, so the minimum
-    // size of TLS-related RSA key is 768 bits (due to the usage of
-    // the ECDHE-RSA-AES256-GCM-SHA384 suite).
-    "--ipki_server_key_size=768",
-
-    // The RSA key of 768 bits is too short if OpenSSL security level is set to
-    // 1 or higher (applicable for OpenSSL 1.1.0 and newer). Lowering the
-    // security level to 0 makes possible ot use shorter keys in such cases.
-    "--openssl_security_level_override=0",
-
     // Disable minidumps by default since many tests purposely inject faults.
     "--enable_minidumps=false",
 
@@ -1005,6 +1006,23 @@ Status ExternalDaemon::StartProcess(const vector<string>& user_flags) {
     // Ensure that logging goes to the test output and doesn't get buffered.
     argv.emplace_back("--logtostderr");
     argv.emplace_back("--logbuflevel=-1");
+  }
+
+  // If large keys are not enabled.
+  if (!UseLargeKeys()) {
+    // Generate smaller RSA keys -- generating a 768-bit key is faster
+    // than generating the default 2048-bit key, and we don't care about
+    // strong encryption in tests. Setting it lower (e.g. 512 bits) results
+    // in OpenSSL errors RSA_sign:digest too big for rsa key:rsa_sign.c:122
+    // since we are using strong/high TLS v1.2 cipher suites, so the minimum
+    // size of TLS-related RSA key is 768 bits (due to the usage of
+    // the ECDHE-RSA-AES256-GCM-SHA384 suite).
+    argv.emplace_back("--ipki_server_key_size=768");
+
+    // The RSA key of 768 bits is too short if OpenSSL security level is set to
+    // 1 or higher (applicable for OpenSSL 1.1.0 and newer). Lowering the
+    // security level to 0 makes possible ot use shorter keys in such cases.
+    argv.emplace_back("--openssl_security_level_override=0");
   }
 
   // Add all the flags coming from the minicluster framework.
@@ -1432,18 +1450,20 @@ Status ExternalMaster::WaitForCatalogManager(WaitMode wait_mode) {
 }
 
 const vector<string>& ExternalMaster::GetCommonFlags() {
-  static const vector<string> kFlags = {
-    // See the in-line comment for "--ipki_server_key_size" flag in
-    // ExternalDaemon::StartProcess() method.
-    "--ipki_ca_key_size=768",
+  static vector<string> kFlags;
+  if (!UseLargeKeys()) {
+    kFlags = {
+        // See the in-line comment for "--ipki_server_key_size" flag in
+        // ExternalDaemon::StartProcess() method.
+        "--ipki_ca_key_size=768",
 
-    // As for the TSK keys, 512 bits is the minimum since we are using
-    // SHA256 digest for token signing/verification.
-    "--tsk_num_rsa_bits=512",
-  };
+        // As for the TSK keys, 512 bits is the minimum since we are using
+        // SHA256 digest for token signing/verification.
+        "--tsk_num_rsa_bits=512",
+    };
+  }
   return kFlags;
 }
-
 
 //------------------------------------------------------------
 // ExternalTabletServer

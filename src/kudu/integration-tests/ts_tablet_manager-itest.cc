@@ -1052,7 +1052,8 @@ class TxnStatusTabletManagementTest : public TsTabletManagerITest {
   // Creates a tablet with a fixed schema, with the given tablet ID.
   Status CreateTablet(MiniTabletServer* ts,
                       const string& tablet_id,
-                      bool is_txn_status_tablet) {
+                      bool is_txn_status_tablet,
+                      scoped_refptr<TabletReplica>* replica = nullptr) {
     CreateTabletRequestPB req = CreateTxnTabletReq(
         tablet_id, ts->server()->fs_manager()->uuid(), ts->CreateLocalConfig(),
         is_txn_status_tablet);
@@ -1071,19 +1072,48 @@ class TxnStatusTabletManagementTest : public TsTabletManagerITest {
     RETURN_NOT_OK(admin_proxy->CreateTablet(req, &resp, &rpc));
     scoped_refptr<TabletReplica> r;
     CHECK(ts->server()->tablet_manager()->LookupTablet(tablet_id, &r));
-    return r->consensus()->WaitUntilLeaderForTests(kTimeout);
+
+    // Wait for the tablet to be in RUNNING state and its consensus running too.
+    RETURN_NOT_OK(r->WaitUntilConsensusRunning(kTimeout));
+    auto s = r->consensus()->WaitUntilLeaderForTests(kTimeout);
+    if (replica) {
+      *replica = std::move(r);
+    }
+    return s;
   }
 
-  // Creates a transaction status tablet at the given tablet server.
+  // Creates a transaction status tablet at the given tablet server,
+  // waiting for the transaction status data to be loaded from the tablet.
   Status CreateTxnStatusTablet(MiniTabletServer* ts) {
-    return CreateTablet(ts, kTxnStatusTabletId, /*is_txn_status_tablet*/true);
+    scoped_refptr<TabletReplica> r;
+    RETURN_NOT_OK(CreateTablet(
+        ts, kTxnStatusTabletId, /*is_txn_status_tablet*/true, &r));
+    TxnCoordinator* c = CHECK_NOTNULL(CHECK_NOTNULL(r)->txn_coordinator());
+
+    // Wait for the transaction status data to be loaded. The verification below
+    // relies on the internals of the TxnStatusManager's implementation, but it
+    // seems OK for test purposes.
+    const auto deadline = MonoTime::Now() + kTimeout;
+    bool is_data_loaded = false;
+    do {
+      auto txn_id = c->highest_txn_id();
+      if (txn_id >= -1) {
+        is_data_loaded = true;
+        break;
+      }
+      SleepFor(MonoDelta::FromMilliseconds(10));
+    } while (MonoTime::Now() < deadline);
+
+    return is_data_loaded
+        ? Status::OK()
+        : Status::TimedOut("timed out waiting for txn status data to be loaded");
   }
 
   static Status StartTransactions(const ParticipantIdsByTxnId& txns, TxnCoordinator* coordinator) {
     TabletServerErrorPB ts_error;
     for (const auto& txn_id_and_prt_ids : txns) {
       const auto& txn_id = txn_id_and_prt_ids.first;
-      RETURN_NOT_OK(coordinator->BeginTransaction(txn_id, kOwner, &ts_error));
+      RETURN_NOT_OK(coordinator->BeginTransaction(txn_id, kOwner, nullptr, &ts_error));
       for (const auto& prt_id : txn_id_and_prt_ids.second) {
         RETURN_NOT_OK(coordinator->RegisterParticipant(txn_id, prt_id, kOwner, &ts_error));
       }
@@ -1204,6 +1234,7 @@ TEST_F(TxnStatusTabletManagementTest, TestTabletServerProxyCalls) {
     CoordinatorOpPB::REGISTER_PARTICIPANT,
     CoordinatorOpPB::BEGIN_COMMIT_TXN,
     CoordinatorOpPB::ABORT_TXN,
+    CoordinatorOpPB::GET_TXN_STATUS,
   };
   // Perform the series of ops for the given transaction ID as the given user,
   // erroring out if an unexpected result is received. If 'user' is empty, use
@@ -1230,7 +1261,9 @@ TEST_F(TxnStatusTabletManagementTest, TestTabletServerProxyCalls) {
       SCOPED_TRACE(SecureDebugString(resp));
       if (expect_success) {
         ASSERT_FALSE(resp.has_error());
-        ASSERT_FALSE(resp.has_op_result());
+        ASSERT_EQ(op_type == CoordinatorOpPB::BEGIN_TXN ||
+                  op_type == CoordinatorOpPB::GET_TXN_STATUS,
+                  resp.has_op_result());
       } else {
         ASSERT_TRUE(s.IsRemoteError()) << s.ToString();
         ASSERT_STR_CONTAINS(s.ToString(), "Not authorized");
@@ -1321,7 +1354,8 @@ TEST_F(TxnStatusTabletManagementTest, TestTabletServerProxyCallErrors) {
       ASSERT_OK(admin_proxy->CoordinateTransaction(req, &resp, &rpc));
       SCOPED_TRACE(SecureDebugString(resp));
       ASSERT_FALSE(resp.has_error());
-      ASSERT_FALSE(resp.has_op_result());
+      ASSERT_TRUE(resp.has_op_result());
+      ASSERT_EQ(1, resp.op_result().highest_seen_txn_id());
     }
     {
       CoordinateTransactionResponsePB resp;
@@ -1330,6 +1364,7 @@ TEST_F(TxnStatusTabletManagementTest, TestTabletServerProxyCallErrors) {
       SCOPED_TRACE(SecureDebugString(resp));
       ASSERT_FALSE(resp.has_error());
       ASSERT_TRUE(resp.has_op_result());
+      ASSERT_EQ(1, resp.op_result().highest_seen_txn_id());
       Status s = StatusFromPB(resp.op_result().op_error());
       ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
       ASSERT_STR_CONTAINS(s.ToString(), "not higher than the highest ID so far");

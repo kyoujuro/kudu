@@ -37,6 +37,7 @@
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/transactions/coordinator_rpc.h"
 #include "kudu/transactions/txn_status_tablet.h"
+#include "kudu/transactions/transactions.pb.h"
 #include "kudu/tserver/tserver_admin.pb.h"
 #include "kudu/util/async_util.h"
 
@@ -48,6 +49,7 @@ using kudu::client::KuduTableAlterer;
 using kudu::client::KuduTableCreator;
 using kudu::client::internal::MetaCache;
 using kudu::tserver::CoordinatorOpPB;
+using kudu::tserver::CoordinatorOpResultPB;
 using std::string;
 using std::unique_ptr;
 using std::vector;
@@ -57,6 +59,7 @@ namespace transactions {
 
 Status TxnSystemClient::Create(const vector<string>& master_addrs,
                                unique_ptr<TxnSystemClient>* sys_client) {
+  DCHECK(!master_addrs.empty());
   KuduClientBuilder builder;
   builder.master_server_addrs(master_addrs);
   client::sp::shared_ptr<KuduClient> client;
@@ -120,16 +123,25 @@ Status TxnSystemClient::OpenTxnStatusTable() {
   return Status::OK();
 }
 
-Status TxnSystemClient::BeginTransaction(int64_t txn_id, const string& user, MonoDelta timeout) {
+Status TxnSystemClient::BeginTransaction(int64_t txn_id,
+                                         const string& user,
+                                         int64_t* highest_seen_txn_id,
+                                         MonoDelta timeout) {
   CoordinatorOpPB coordinate_txn_op;
   coordinate_txn_op.set_type(CoordinatorOpPB::BEGIN_TXN);
   coordinate_txn_op.set_txn_id(txn_id);
   coordinate_txn_op.set_user(user);
   Synchronizer s;
+  CoordinatorOpResultPB result;
   RETURN_NOT_OK(CoordinateTransactionAsync(std::move(coordinate_txn_op),
                                            timeout,
-                                           s.AsStatusCallback()));
-  return s.Wait();
+                                           s.AsStatusCallback(),
+                                           &result));
+  const auto ret = s.Wait();
+  if (result.has_highest_seen_txn_id() && highest_seen_txn_id) {
+    *highest_seen_txn_id = result.highest_seen_txn_id();
+  }
+  return ret;
 }
 
 Status TxnSystemClient::RegisterParticipant(int64_t txn_id, const string& participant_id,
@@ -174,9 +186,39 @@ Status TxnSystemClient::AbortTransaction(int64_t txn_id,
   return s.Wait();
 }
 
+Status TxnSystemClient::GetTransactionStatus(int64_t txn_id,
+                                             const string& user,
+                                             TxnStatusEntryPB* txn_status,
+                                             MonoDelta timeout) {
+  DCHECK(txn_status);
+  CoordinatorOpPB coordinate_txn_op;
+  coordinate_txn_op.set_type(CoordinatorOpPB::GET_TXN_STATUS);
+  coordinate_txn_op.set_txn_id(txn_id);
+  coordinate_txn_op.set_user(user);
+  Synchronizer s;
+  CoordinatorOpResultPB result;
+  RETURN_NOT_OK(CoordinateTransactionAsync(std::move(coordinate_txn_op),
+                                           timeout,
+                                           s.AsStatusCallback(),
+                                           &result));
+  const auto ret = s.Wait();
+  if (ret.ok()) {
+    // Retrieve the response and set corresponding output parameters.
+    DCHECK(!result.has_op_error());
+    DCHECK(result.has_txn_status());
+    TxnStatusEntryPB ret;
+    ret.set_state(result.txn_status().state());
+    ret.set_allocated_user(result.mutable_txn_status()->release_user());
+    *txn_status = std::move(ret);
+  }
+  return ret;
+}
+
 Status TxnSystemClient::CoordinateTransactionAsync(CoordinatorOpPB coordinate_txn_op,
                                                    const MonoDelta& timeout,
-                                                   const StatusCallback& cb) {
+                                                   const StatusCallback& cb,
+                                                   CoordinatorOpResultPB* result) {
+  DCHECK(txn_status_table_);
   const MonoTime deadline = MonoTime::Now() + timeout;
   unique_ptr<TxnStatusTabletContext> ctx(
       new TxnStatusTabletContext({
@@ -200,7 +242,7 @@ Status TxnSystemClient::CoordinateTransactionAsync(CoordinatorOpPB coordinate_tx
       &ctx_raw->tablet,
       // TODO(awong): when we start using C++14, stack-allocate 'ctx' and
       // move capture it.
-      [cb, deadline, ctx_raw] (const Status& s) {
+      [cb, deadline, ctx_raw, result] (const Status& s) {
         // First, take ownership of the context.
         unique_ptr<TxnStatusTabletContext> ctx(ctx_raw);
 
@@ -213,7 +255,8 @@ Status TxnSystemClient::CoordinateTransactionAsync(CoordinatorOpPB coordinate_tx
         CoordinatorRpc* rpc = CoordinatorRpc::NewRpc(
             std::move(ctx),
             deadline,
-            cb);
+            cb,
+            result);
         rpc->SendRpc();
       });
   return Status::OK();

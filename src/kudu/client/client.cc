@@ -29,6 +29,7 @@
 #include <vector>
 
 #include <boost/optional/optional.hpp>
+#include <boost/type_traits/decay.hpp>
 #include <glog/logging.h>
 #include <google/protobuf/stubs/common.h>
 
@@ -303,6 +304,12 @@ KuduClientBuilder& KuduClientBuilder::default_rpc_timeout(const MonoDelta& timeo
   return *this;
 }
 
+KuduClientBuilder& KuduClientBuilder::connection_negotiation_timeout(
+    const MonoDelta& timeout) {
+  data_->connection_negotiation_timeout_ = timeout;
+  return *this;
+}
+
 KuduClientBuilder& KuduClientBuilder::import_authentication_credentials(string authn_creds) {
   data_->authn_creds_ = std::move(authn_creds);
   return *this;
@@ -349,6 +356,10 @@ Status KuduClientBuilder::Build(shared_ptr<KuduClient>* client) {
 
   // Init messenger.
   MessengerBuilder builder("client");
+  if (data_->connection_negotiation_timeout_.Initialized()) {
+    builder.set_rpc_negotiation_timeout_ms(
+        data_->connection_negotiation_timeout_.ToMilliseconds());
+  }
   if (data_->num_reactors_) {
     builder.set_num_reactors(data_->num_reactors_.get());
   }
@@ -631,6 +642,12 @@ const MonoDelta& KuduClient::default_rpc_timeout() const {
   return data_->default_rpc_timeout_;
 }
 
+MonoDelta KuduClient::connection_negotiation_timeout() const {
+  DCHECK(data_->messenger_);
+  return MonoDelta::FromMilliseconds(
+      data_->messenger_->rpc_negotiation_timeout_ms());
+}
+
 const uint64_t KuduClient::kNoTimestamp = 0;
 
 uint64_t KuduClient::GetLatestObservedTimestamp() const {
@@ -681,6 +698,10 @@ string KuduClient::GetHiveMetastoreUuid() const {
 
 string KuduClient::location() const {
   return data_->location();
+}
+
+string KuduClient::cluster_id() const {
+  return data_->cluster_id();
 }
 
 ////////////////////////////////////////////////////////////
@@ -962,8 +983,16 @@ KuduUpdate* KuduTable::NewUpdate() {
   return new KuduUpdate(shared_from_this());
 }
 
+KuduUpdateIgnore* KuduTable::NewUpdateIgnore() {
+  return new KuduUpdateIgnore(shared_from_this());
+}
+
 KuduDelete* KuduTable::NewDelete() {
   return new KuduDelete(shared_from_this());
+}
+
+KuduDeleteIgnore* KuduTable::NewDeleteIgnore() {
+  return new KuduDeleteIgnore(shared_from_this());
 }
 
 KuduClient* KuduTable::client() const {
@@ -1149,16 +1178,17 @@ KuduError::~KuduError() {
 ////////////////////////////////////////////////////////////
 
 KuduSession::KuduSession(const shared_ptr<KuduClient>& client)
-  : data_(new KuduSession::Data(client, client->data_->messenger_)) {
+    : data_(new KuduSession::Data(client, client->data_->messenger_)) {
+}
+
+KuduSession::KuduSession(const shared_ptr<KuduClient>& client,
+                         const TxnId& txn_id)
+    : data_(new KuduSession::Data(client, client->data_->messenger_, txn_id)) {
 }
 
 KuduSession::~KuduSession() {
   WARN_NOT_OK(data_->Close(true), "Closed Session with pending operations.");
   delete data_;
-}
-
-Status KuduSession::Close() {
-  return data_->Close(false);
 }
 
 Status KuduSession::SetFlushMode(FlushMode m) {
@@ -1198,18 +1228,6 @@ void KuduSession::SetTimeoutMillis(int timeout_ms) {
   data_->SetTimeoutMillis(timeout_ms);
 }
 
-Status KuduSession::Flush() {
-  return data_->Flush();
-}
-
-void KuduSession::FlushAsync(KuduStatusCallback* user_callback) {
-  data_->FlushAsync(user_callback);
-}
-
-bool KuduSession::HasPendingOperations() const {
-  return data_->HasPendingOperations();
-}
-
 Status KuduSession::Apply(KuduWriteOperation* write_op) {
   RETURN_NOT_OK(data_->ApplyWriteOp(write_op));
   // Thread-safety note: this method should not be called concurrently
@@ -1219,6 +1237,22 @@ Status KuduSession::Apply(KuduWriteOperation* write_op) {
     RETURN_NOT_OK(data_->Flush());
   }
   return Status::OK();
+}
+
+Status KuduSession::Flush() {
+  return data_->Flush();
+}
+
+void KuduSession::FlushAsync(KuduStatusCallback* user_callback) {
+  data_->FlushAsync(user_callback);
+}
+
+Status KuduSession::Close() {
+  return data_->Close(false);
+}
+
+bool KuduSession::HasPendingOperations() const {
+  return data_->HasPendingOperations();
 }
 
 int KuduSession::CountBufferedOperations() const {

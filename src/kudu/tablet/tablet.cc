@@ -50,6 +50,7 @@
 #include "kudu/common/wire_protocol.pb.h"
 #include "kudu/consensus/log_anchor_registry.h"
 #include "kudu/consensus/opid.pb.h"
+#include "kudu/fs/block_manager.h"
 #include "kudu/fs/fs_manager.h"
 #include "kudu/fs/io_context.h"
 #include "kudu/gutil/casts.h"
@@ -63,6 +64,7 @@
 #include "kudu/tablet/diskrowset.h"
 #include "kudu/tablet/memrowset.h"
 #include "kudu/tablet/ops/alter_schema_op.h"
+#include "kudu/tablet/ops/participant_op.h"
 #include "kudu/tablet/ops/write_op.h"
 #include "kudu/tablet/row_op.h"
 #include "kudu/tablet/rowset_info.h"
@@ -73,6 +75,7 @@
 #include "kudu/tablet/tablet_metrics.h"
 #include "kudu/tablet/tablet_mm_ops.h"
 #include "kudu/tserver/tserver.pb.h"
+#include "kudu/tserver/tserver_admin.pb.h"
 #include "kudu/util/bitmap.h"
 #include "kudu/util/bloom_filter.h"
 #include "kudu/util/debug/trace_event.h"
@@ -206,8 +209,10 @@ METRIC_DEFINE_gauge_uint64(tablet, last_write_elapsed_time, "Seconds Since Last 
 
 using kudu::MaintenanceManager;
 using kudu::clock::HybridClock;
+using kudu::consensus::OpId;
 using kudu::fs::IOContext;
 using kudu::log::LogAnchorRegistry;
+using kudu::log::MinLogIndexAnchorer;
 using std::endl;
 using std::make_shared;
 using std::ostream;
@@ -253,6 +258,7 @@ Tablet::Tablet(scoped_refptr<TabletMetadata> metadata,
     mem_trackers_(tablet_id(), std::move(parent_mem_tracker)),
     next_mrs_id_(0),
     clock_(clock),
+    txn_participant_(metadata_),
     rowsets_flush_sem_(1),
     state_(kInitialized),
     last_write_time_(MonoTime::Now()),
@@ -312,7 +318,7 @@ Tablet::~Tablet() {
   CHECK_EQ(expected_state, _local_state); \
 } while (0)
 
-Status Tablet::Open() {
+Status Tablet::Open(const unordered_set<int64_t>& in_flight_txn_ids) {
   TRACE_EVENT0("tablet", "Tablet::Open");
   RETURN_IF_STOPPED_OR_CHECK_STATE(kInitialized);
 
@@ -321,6 +327,14 @@ Status Tablet::Open() {
   next_mrs_id_ = metadata_->last_durable_mrs_id() + 1;
 
   RowSetVector rowsets_opened;
+
+  // If we persisted the state of any transaction IDs before shutting down,
+  // initialize those that were in-flight here as kOpen. If there were any ops
+  // applied that didn't get persisted to the tablet metadata, the bootstrap
+  // process will replay those ops.
+  for (const auto& txn_id : in_flight_txn_ids) {
+    txn_participant_.CreateOpenTransaction(txn_id, log_anchor_registry_.get());
+  }
 
   fs::IOContext io_context({ tablet_id() });
   // open the tablet row-sets
@@ -576,7 +590,15 @@ void Tablet::StartOp(WriteOpState* op_state) {
   unique_ptr<ScopedOp> mvcc_op;
   DCHECK(op_state->has_timestamp());
   mvcc_op.reset(new ScopedOp(&mvcc_, op_state->timestamp()));
-  op_state->SetMvccTx(std::move(mvcc_op));
+  op_state->SetMvccOp(std::move(mvcc_op));
+}
+
+void Tablet::StartOp(ParticipantOpState* op_state) {
+  if (op_state->request()->op().type() == tserver::ParticipantOpPB::BEGIN_COMMIT) {
+    DCHECK(op_state->has_timestamp());
+    unique_ptr<ScopedOp> mvcc_op(new ScopedOp(&mvcc_, op_state->timestamp()));
+    op_state->SetMvccOp(std::move(mvcc_op));
+  }
 }
 
 bool Tablet::ValidateOpOrMarkFailed(RowOp* op) {
@@ -604,7 +626,9 @@ Status Tablet::ValidateOp(const RowOp& op) {
       return ValidateInsertOrUpsertUnlocked(op);
 
     case RowOperationsPB::UPDATE:
+    case RowOperationsPB::UPDATE_IGNORE:
     case RowOperationsPB::DELETE:
+    case RowOperationsPB::DELETE_IGNORE:
       return ValidateMutateUnlocked(op);
 
     default:
@@ -802,10 +826,10 @@ vector<RowSet*> Tablet::FindRowSetsToCheck(const RowOp* op,
 
 Status Tablet::MutateRowUnlocked(const IOContext* io_context,
                                  WriteOpState *op_state,
-                                 RowOp* mutate,
+                                 RowOp* op,
                                  ProbeStats* stats) {
-  DCHECK(mutate->checked_present);
-  DCHECK(mutate->valid);
+  DCHECK(op->checked_present);
+  DCHECK(op->valid);
 
   auto* result = google::protobuf::Arena::CreateMessage<OperationResultPB>(
       op_state->pb_arena());
@@ -814,23 +838,38 @@ Status Tablet::MutateRowUnlocked(const IOContext* io_context,
 
   // If we found the row in any existing RowSet, mutate it there. Otherwise
   // attempt to mutate in the MRS.
-  RowSet* rs_to_attempt = mutate->present_in_rowset ?
-      mutate->present_in_rowset : comps->memrowset.get();
+  RowSet* rs_to_attempt = op->present_in_rowset ?
+      op->present_in_rowset : comps->memrowset.get();
   Status s = rs_to_attempt->MutateRow(ts,
-                                      *mutate->key_probe,
-                                      mutate->decoded_op.changelist,
+                                      *op->key_probe,
+                                      op->decoded_op.changelist,
                                       op_state->op_id(),
                                       io_context,
                                       stats,
                                       result);
   if (PREDICT_TRUE(s.ok())) {
-    mutate->SetMutateSucceeded(result);
+    op->SetMutateSucceeded(result);
   } else {
     if (s.IsNotFound()) {
-      // Replace internal error messages with one more suitable for users.
-      s = Status::NotFound("key not found");
+      RowOperationsPB_Type op_type = op->decoded_op.type;
+      switch (op_type) {
+        case RowOperationsPB::UPDATE_IGNORE:
+        case RowOperationsPB::DELETE_IGNORE:
+          s = Status::OK();
+          op->SetErrorIgnored();
+          break;
+        case RowOperationsPB::UPDATE:
+        case RowOperationsPB::DELETE:
+          // Replace internal error messages with one more suitable for users.
+          s = Status::NotFound("key not found");
+          op->SetFailed(s);
+          break;
+        default:
+          LOG(FATAL) << "Unknown operation type: " << op_type;
+      }
+    } else {
+      op->SetFailed(s);
     }
-    mutate->SetFailed(s);
   }
   return s;
 }
@@ -839,6 +878,17 @@ void Tablet::StartApplying(WriteOpState* op_state) {
   shared_lock<rw_spinlock> l(component_lock_);
   op_state->StartApplying();
   op_state->set_tablet_components(components_);
+}
+
+void Tablet::StartApplying(ParticipantOpState* op_state) {
+  const auto& op_type = op_state->request()->op().type();
+  if (op_type == tserver::ParticipantOpPB::FINALIZE_COMMIT) {
+    // NOTE: we may not have an MVCC op if we are bootstrapping and did not
+    // replay a BEGIN_COMMIT op.
+    if (op_state->txn()->commit_op()) {
+      op_state->txn()->commit_op()->StartApplying();
+    }
+  }
 }
 
 Status Tablet::BulkCheckPresence(const IOContext* io_context, WriteOpState* op_state) {
@@ -983,6 +1033,38 @@ Status Tablet::CheckHasNotBeenStopped(State* cur_state) const {
   return Status::OK();
 }
 
+void Tablet::BeginTransaction(Txn* txn, const OpId& op_id) {
+  unique_ptr<MinLogIndexAnchorer> anchor(new MinLogIndexAnchorer(log_anchor_registry_.get(),
+        Substitute("BEGIN_TXN-$0-$1", txn->txn_id(), txn)));
+  anchor->AnchorIfMinimum(op_id.index());
+  metadata_->AddTxnMetadata(txn->txn_id(), std::move(anchor));
+  txn->BeginTransaction();
+}
+
+void Tablet::BeginCommit(Txn* txn, Timestamp mvcc_op_ts, const OpId& op_id) {
+  unique_ptr<MinLogIndexAnchorer> anchor(new MinLogIndexAnchorer(log_anchor_registry_.get(),
+        Substitute("BEGIN_COMMIT-$0-$1", txn->txn_id(), txn)));
+  anchor->AnchorIfMinimum(op_id.index());
+  metadata_->BeginCommitTransaction(txn->txn_id(), mvcc_op_ts, std::move(anchor));
+  txn->BeginCommit(op_id);
+}
+
+void Tablet::CommitTransaction(Txn* txn, Timestamp commit_ts, const OpId& op_id) {
+  unique_ptr<MinLogIndexAnchorer> anchor(new MinLogIndexAnchorer(log_anchor_registry_.get(),
+        Substitute("FINALIZE_COMMIT-$0-$1", txn->txn_id(), txn)));
+  anchor->AnchorIfMinimum(op_id.index());
+  metadata_->AddCommitTimestamp(txn->txn_id(), commit_ts, std::move(anchor));
+  txn->FinalizeCommit(commit_ts.value());
+}
+
+void Tablet::AbortTransaction(Txn* txn,  const OpId& op_id) {
+  unique_ptr<MinLogIndexAnchorer> anchor(new MinLogIndexAnchorer(log_anchor_registry_.get(),
+        Substitute("ABORT_TXN-$0-$1", txn->txn_id(), txn)));
+  anchor->AnchorIfMinimum(op_id.index());
+  metadata_->AbortTransaction(txn->txn_id(), std::move(anchor));
+  txn->AbortTransaction();
+}
+
 Status Tablet::ApplyRowOperations(WriteOpState* op_state) {
   int num_ops = op_state->row_ops().size();
 
@@ -1058,7 +1140,9 @@ Status Tablet::ApplyRowOperation(const IOContext* io_context,
       return s;
 
     case RowOperationsPB::UPDATE:
+    case RowOperationsPB::UPDATE_IGNORE:
     case RowOperationsPB::DELETE:
+    case RowOperationsPB::DELETE_IGNORE:
       s = MutateRowUnlocked(io_context, op_state, row_op, stats);
       if (s.IsNotFound()) {
         return Status::OK();
@@ -1583,7 +1667,8 @@ Status Tablet::DoMergeCompactionOrFlush(const RowSetsInCompaction &input,
                "tablet_id", tablet_id(),
                "op", op_name);
 
-  const IOContext io_context({ tablet_id() });
+  const auto& tid = tablet_id();
+  const IOContext io_context({ tid });
 
   MvccSnapshot flush_snap(mvcc_);
   VLOG_WITH_PREFIX(1) << Substitute("$0: entering phase 1 (flushing snapshot). "
@@ -1603,8 +1688,11 @@ Status Tablet::DoMergeCompactionOrFlush(const RowSetsInCompaction &input,
   RETURN_NOT_OK_PREPEND(drsw.Open(), "Failed to open DiskRowSet for flush");
 
   HistoryGcOpts history_gc_opts = GetHistoryGcOpts();
-  RETURN_NOT_OK_PREPEND(FlushCompactionInput(merge.get(), flush_snap, history_gc_opts, &drsw),
-                        "Flush to disk failed");
+  RETURN_NOT_OK_PREPEND(
+      FlushCompactionInput(
+          tid, metadata_->fs_manager()->block_manager()->error_manager(),
+          merge.get(), flush_snap, history_gc_opts, &drsw),
+      "Flush to disk failed");
   RETURN_NOT_OK_PREPEND(drsw.Finish(), "Failed to finish DRS writer");
 
   if (common_hooks_) {
@@ -1679,7 +1767,7 @@ Status Tablet::DoMergeCompactionOrFlush(const RowSetsInCompaction &input,
                                     "duplicate updates in new rowsets)",
                                     op_name);
   shared_ptr<DuplicatingRowSet> inprogress_rowset(
-    new DuplicatingRowSet(input.rowsets(), new_disk_rowsets));
+      new DuplicatingRowSet(input.rowsets(), new_disk_rowsets));
 
   // The next step is to swap in the DuplicatingRowSet, and at the same time,
   // determine an MVCC snapshot which includes all of the ops that saw a
@@ -2135,20 +2223,6 @@ bool Tablet::DeltaMemRowSetEmpty() const {
   return true;
 }
 
-void Tablet::GetInfoForBestDMSToFlush(const ReplaySizeMap& replay_size_map,
-                                      int64_t* mem_size, int64_t* replay_size) const {
-  shared_ptr<RowSet> rowset = FindBestDMSToFlush(replay_size_map);
-
-  if (rowset) {
-    *replay_size = GetReplaySizeForIndex(rowset->MinUnflushedLogIndex(),
-                                         replay_size_map);
-    *mem_size = rowset->DeltaMemStoreSize();
-  } else {
-    *replay_size = 0;
-    *mem_size = 0;
-  }
-}
-
 Status Tablet::FlushBestDMS(const ReplaySizeMap &replay_size_map) const {
   RETURN_IF_STOPPED_OR_CHECK_STATE(kOpen);
   shared_ptr<RowSet> rowset = FindBestDMSToFlush(replay_size_map);
@@ -2159,33 +2233,52 @@ Status Tablet::FlushBestDMS(const ReplaySizeMap &replay_size_map) const {
   return Status::OK();
 }
 
-shared_ptr<RowSet> Tablet::FindBestDMSToFlush(const ReplaySizeMap& replay_size_map) const {
+shared_ptr<RowSet> Tablet::FindBestDMSToFlush(const ReplaySizeMap& replay_size_map,
+                                              int64_t* mem_size, int64_t* replay_size,
+                                              MonoTime* earliest_dms_time) const {
   scoped_refptr<TabletComponents> comps;
   GetComponents(&comps);
-  int64_t mem_size = 0;
+  int64_t max_dms_size = 0;
   double max_score = 0;
   double mem_weight = 0;
+  int64_t dms_replay_size = 0;
+  MonoTime earliest_creation_time = MonoTime::Max();
   // If system is under memory pressure, we use the percentage of the hard limit consumed
   // as mem_weight, so the tighter memory, the higher weight. Otherwise just left the
   // mem_weight to 0.
   process_memory::UnderMemoryPressure(&mem_weight);
 
   shared_ptr<RowSet> best_dms;
-  for (const shared_ptr<RowSet> &rowset : comps->rowsets->all_rowsets()) {
-    if (rowset->DeltaMemStoreEmpty()) {
+  for (const shared_ptr<RowSet>& rowset : comps->rowsets->all_rowsets()) {
+    size_t dms_size_bytes;
+    MonoTime creation_time;
+    if (!rowset->DeltaMemStoreInfo(&dms_size_bytes, &creation_time)) {
       continue;
     }
-    int64_t size = GetReplaySizeForIndex(rowset->MinUnflushedLogIndex(),
-                                         replay_size_map);
-    int64_t mem = rowset->DeltaMemStoreSize();
-    double score = mem * mem_weight + size * (100 - mem_weight);
-
+    earliest_creation_time = std::min(earliest_creation_time, creation_time);
+    int64_t replay_size_bytes = GetReplaySizeForIndex(rowset->MinUnflushedLogIndex(),
+                                                      replay_size_map);
+    // To facilitate memory-based flushing when under memory pressure, we
+    // define a score that's part memory and part WAL retention bytes.
+    double score = dms_size_bytes * mem_weight + replay_size_bytes * (100 - mem_weight);
     if ((score > max_score) ||
-        (score > max_score - 1 && mem > mem_size)) {
+        // If the score is close to the max, as a tie-breaker, just look at the
+        // DMS size.
+        (score > max_score - 1 && dms_size_bytes > max_dms_size)) {
       max_score = score;
-      mem_size = mem;
+      max_dms_size = dms_size_bytes;
+      dms_replay_size = replay_size_bytes;
       best_dms = rowset;
     }
+  }
+  if (earliest_dms_time) {
+    *earliest_dms_time = earliest_creation_time;
+  }
+  if (mem_size) {
+    *mem_size = max_dms_size;
+  }
+  if (replay_size) {
+    *replay_size = dms_replay_size;
   }
   return best_dms;
 }

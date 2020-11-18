@@ -60,6 +60,7 @@ class MonoDelta;
 class Partition;
 class PartitionSchema;
 class SecurityUnknownTskTest;
+class TxnId;
 
 namespace client {
 class KuduClient;
@@ -80,6 +81,7 @@ namespace client {
 
 class KuduColumnarScanBatch;
 class KuduDelete;
+class KuduDeleteIgnore;
 class KuduInsert;
 class KuduInsertIgnore;
 class KuduLoggingCallback;
@@ -93,6 +95,7 @@ class KuduTableStatistics;
 class KuduTablet;
 class KuduTabletServer;
 class KuduUpdate;
+class KuduUpdateIgnore;
 class KuduUpsert;
 class KuduValue;
 class KuduWriteOperation;
@@ -259,6 +262,22 @@ class KUDU_EXPORT KuduClientBuilder {
   ///   Timeout value to set.
   /// @return Reference to the updated object.
   KuduClientBuilder& default_rpc_timeout(const MonoDelta& timeout);
+
+  /// Set the timeout for negotiating a connection to a remote server.
+  ///
+  /// If not provided, the underlying messenger is created with reasonable
+  /// default. The result value could be retrieved using
+  /// @c KuduClient.connection_negotiation_timeout() after an instance of
+  /// @c KuduClient is created. Sometimes it makes sense to customize the
+  /// timeout for connection negotiation, e.g. when running on a cluster with
+  /// heavily loaded tablet servers. For details on the connection negotiation,
+  /// see ../../../docs/design-docs/rpc.md#negotiation.
+  ///
+  /// @param [in] timeout
+  ///   Timeout value to set.
+  /// @return Reference to the updated object.
+  KuduClientBuilder& connection_negotiation_timeout(const MonoDelta& timeout);
+
 
   /// Import serialized authentication credentials from another client.
   ///
@@ -515,6 +534,9 @@ class KUDU_EXPORT KuduClient : public sp::enable_shared_from_this<KuduClient> {
   /// @return Default timeout for RPCs.
   const MonoDelta& default_rpc_timeout() const;
 
+  /// @return Timeout for connection negotiation to a remote server.
+  MonoDelta connection_negotiation_timeout() const;
+
   /// Value for the latest observed timestamp when none has been observed
   /// or set.
   static const uint64_t kNoTimestamp;
@@ -594,6 +616,11 @@ class KUDU_EXPORT KuduClient : public sp::enable_shared_from_this<KuduClient> {
   ///   assigned yet, or if the leader master did not assign a location to
   ///   the client.
   std::string location() const KUDU_NO_EXPORT;
+
+  /// Private API.
+  ///
+  /// @return The ID of the cluster that this client is connected to.
+  std::string cluster_id() const KUDU_NO_EXPORT;
   /// @endcond
 
  private:
@@ -629,6 +656,7 @@ class KUDU_EXPORT KuduClient : public sp::enable_shared_from_this<KuduClient> {
   friend class tools::RemoteKsckCluster;
 
   FRIEND_TEST(kudu::ClientStressTest, TestUniqueClientIds);
+  FRIEND_TEST(ClientTest, ConnectionNegotiationTimeout);
   FRIEND_TEST(ClientTest, TestCacheAuthzTokens);
   FRIEND_TEST(ClientTest, TestGetSecurityInfoFromMaster);
   FRIEND_TEST(ClientTest, TestGetTabletServerBlacklist);
@@ -1079,10 +1107,20 @@ class KUDU_EXPORT KuduTable : public sp::enable_shared_from_this<KuduTable> {
   ///   KuduSession::Apply().
   KuduUpdate* NewUpdate();
 
+  /// @return New @c UPDATE_IGNORE operation for this table. It is the
+  ///   caller's responsibility to free the result, unless it is passed to
+  ///   KuduSession::Apply().
+  KuduUpdateIgnore* NewUpdateIgnore();
+
   /// @return New @c DELETE operation for this table. It is the caller's
   ///   responsibility to free the result, unless it is passed to
   ///   KuduSession::Apply().
   KuduDelete* NewDelete();
+
+  /// @return New @c DELETE_IGNORE operation for this table. It is the
+  ///   caller's responsibility to free the result, unless it is passed to
+  ///   KuduSession::Apply().
+  KuduDeleteIgnore* NewDeleteIgnore();
 
   /// Create a new comparison predicate.
   ///
@@ -1148,8 +1186,8 @@ class KUDU_EXPORT KuduTable : public sp::enable_shared_from_this<KuduTable> {
   /// @name Advanced/Unstable API
   ///
   /// There are no guarantees on the stability of this client API.
-  ///
   ///@{
+
   /// Create a new IN Bloom filter predicate using direct BlockBloomFilter
   /// pointers which can be used for scanners on this table.
   ///
@@ -2034,8 +2072,10 @@ class KUDU_EXPORT KuduSession : public sp::enable_shared_from_this<KuduSession> 
   friend class ClientTest;
   FRIEND_TEST(ClientTest, TestAutoFlushBackgroundApplyBlocks);
   FRIEND_TEST(ClientTest, TestAutoFlushBackgroundAndErrorCollector);
+  FRIEND_TEST(ClientTest, TxnIdOfTransactionalSession);
 
   explicit KuduSession(const sp::shared_ptr<KuduClient>& client);
+  KuduSession(const sp::shared_ptr<KuduClient>& client, const TxnId& txn_id);
 
   // Owned.
   Data* data_;

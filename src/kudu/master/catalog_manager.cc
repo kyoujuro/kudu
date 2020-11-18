@@ -80,7 +80,6 @@
 #include "kudu/consensus/consensus.proxy.h"
 #include "kudu/consensus/opid_util.h"
 #include "kudu/consensus/quorum_util.h"
-#include "kudu/consensus/raft_consensus.h"
 #include "kudu/fs/fs_manager.h"
 #include "kudu/gutil/atomicops.h"
 #include "kudu/gutil/basictypes.h"
@@ -139,6 +138,7 @@
 #include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/mutex.h"
+#include "kudu/util/net/net_util.h"
 #include "kudu/util/pb_util.h"
 #include "kudu/util/random_util.h"
 #include "kudu/util/scoped_cleanup.h"
@@ -828,10 +828,11 @@ Status CatalogManager::Init(bool is_first_run) {
     auto_rebalancer_ = std::move(task);
   }
 
-  RETURN_NOT_OK(master_->GetMasterHostPorts(&master_addresses_));
+  vector<HostPort> master_addresses;
+  RETURN_NOT_OK(master_->GetMasterHostPorts(&master_addresses));
   if (hms::HmsCatalog::IsEnabled()) {
-    string master_addresses = JoinMapped(
-      master_addresses_,
+    string master_addresses_str = JoinMapped(
+      master_addresses,
       [] (const HostPort& hostport) {
         return Substitute("$0:$1", hostport.host(), hostport.port());
       },
@@ -844,7 +845,7 @@ Status CatalogManager::Init(bool is_first_run) {
     // holding leader_lock_, so this is the path of least resistance.
     std::lock_guard<RWMutex> leader_lock_guard(leader_lock_);
 
-    hms_catalog_.reset(new hms::HmsCatalog(std::move(master_addresses)));
+    hms_catalog_.reset(new hms::HmsCatalog(std::move(master_addresses_str)));
     RETURN_NOT_OK_PREPEND(hms_catalog_->Start(HmsClientVerifyKuduSyncConfig::VERIFY),
                           "failed to start Hive Metastore catalog");
 
@@ -909,7 +910,8 @@ Status CatalogManager::InitClusterId() {
   // Once the cluster ID is loaded or stored, store it in a variable for
   // fast lookup.
   if (s.ok()) {
-     master_->set_cluster_id(cluster_id);
+    std::lock_guard<simple_spinlock> l(cluster_id_lock_);
+    cluster_id_ = cluster_id;
   }
 
   return s;
@@ -1275,7 +1277,8 @@ Status CatalogManager::PrepareFollowerClusterId() {
     LOG_WITH_PREFIX(INFO) << kDescription << ": success";
     // Once the cluster ID is loaded or stored, store it in a variable for
     // fast lookup.
-    master_->set_cluster_id(cluster_id);
+    std::lock_guard<simple_spinlock> l(cluster_id_lock_);
+    cluster_id_ = cluster_id;
   } else {
     LOG_WITH_PREFIX(WARNING) << kDescription << ": " << s.ToString();
   }
@@ -1330,7 +1333,7 @@ Status CatalogManager::PrepareFollowerTokenVerifier() {
 Status CatalogManager::PrepareFollower(MonoTime* last_tspk_run) {
   leader_lock_.AssertAcquiredForReading();
   // Load the cluster ID.
-  if (master_->cluster_id().empty()) {
+  if (GetClusterId().empty()) {
     RETURN_NOT_OK(PrepareFollowerClusterId());
   }
   // Load the CA certificate and CA private key.
@@ -1412,6 +1415,12 @@ RaftPeerPB::Role CatalogManager::Role() const {
     }
   }
   return consensus ? consensus->role() : RaftPeerPB::UNKNOWN_ROLE;
+}
+
+RaftConsensus::RoleAndMemberType CatalogManager::GetRoleAndMemberType() const {
+  return IsInitialized() ?
+      sys_catalog_->tablet_replica()->shared_consensus()->GetRoleAndMemberType() :
+      std::make_pair(RaftPeerPB::UNKNOWN_ROLE, RaftPeerPB::UNKNOWN_MEMBER_TYPE);
 }
 
 void CatalogManager::Shutdown() {
@@ -1865,22 +1874,32 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
   // since this step validates that the table name is available in the HMS catalog.
   if (hms_catalog_ && is_user_table) {
     CHECK(rpc);
-    Status s = hms_catalog_->CreateTable(table->id(), normalized_table_name, req.owner(), schema);
+    Status s = hms_catalog_->CreateTable(
+        table->id(), normalized_table_name, GetClusterId(), req.owner(), schema);
     if (!s.ok()) {
-      s = s.CloneAndPrepend(Substitute("an error occurred while creating table $0 in the HMS",
-                                       normalized_table_name));
+      s = s.CloneAndPrepend(Substitute(
+          "failed to create HMS catalog entry for table $0", table->ToString()));
       LOG(WARNING) << s.ToString();
       return SetupError(std::move(s), resp, MasterErrorPB::HIVE_METASTORE_ERROR);
     }
     TRACE("Created new table in HMS catalog");
+    LOG(INFO) << Substitute("created HMS catalog entry for table $0",
+                            table->ToString());
   }
   // Delete the new HMS entry if we exit early.
   auto abort_hms = MakeScopedCleanup([&] {
       // TODO(dan): figure out how to test this.
       if (hms_catalog_ && is_user_table) {
         TRACE("Rolling back HMS table creation");
-        WARN_NOT_OK(hms_catalog_->DropTable(table->id(), normalized_table_name),
-                    "an error occurred while attempting to delete orphaned HMS table entry");
+        auto s = hms_catalog_->DropTable(table->id(), normalized_table_name);
+        if (s.ok()) {
+          LOG(INFO) << Substitute(
+              "deleted orphaned HMS catalog entry for table $0", table->ToString());
+        } else {
+          LOG(WARNING) << Substitute(
+              "failed to delete orphaned HMS catalog entry for table $0: $1",
+              table->ToString(), s.ToString());
+        }
       }
   });
 
@@ -2172,9 +2191,17 @@ Status CatalogManager::DeleteTableRpc(const DeleteTableRequestPB& req,
     }
 
     // Drop the table from the HMS.
+    auto s = hms_catalog_->DropTable(table->id(), l.data().name());
+    if (PREDICT_TRUE(s.ok())) {
+      LOG(INFO) << Substitute(
+          "deleted HMS catalog entry for table $0", table->ToString());
+    } else {
+      LOG(WARNING) << Substitute(
+          "failed to delete HMS catalog entry for table $0: $1",
+          table->ToString(), s.ToString());
+    }
     RETURN_NOT_OK(SetupError(
-          hms_catalog_->DropTable(table->id(), l.data().name()),
-          resp, MasterErrorPB::HIVE_METASTORE_ERROR));
+        std::move(s), resp, MasterErrorPB::HIVE_METASTORE_ERROR));
 
     // Unlock the table, and wait for the notification log listener to handle
     // the delete table event.
@@ -2421,8 +2448,9 @@ Status CatalogManager::ApplyAlterPartitioningSteps(
     }
 
     if (ops.size() != 2) {
-      return Status::InvalidArgument("expected two row operations for alter range partition step",
-                                     SecureShortDebugString(step));
+      return Status::InvalidArgument(
+          "expected two row operations for alter range partition step",
+          SecureShortDebugString(step));
     }
 
     if ((ops[0].type != RowOperationsPB::RANGE_LOWER_BOUND &&
@@ -2431,7 +2459,7 @@ Status CatalogManager::ApplyAlterPartitioningSteps(
          ops[1].type != RowOperationsPB::INCLUSIVE_RANGE_UPPER_BOUND)) {
       return Status::InvalidArgument(
           "expected a lower bound and upper bound row op for alter range partition step",
-          strings::Substitute("$0, $1", ops[0].ToString(schema), ops[1].ToString(schema)));
+          Substitute("$0, $1", ops[0].ToString(schema), ops[1].ToString(schema)));
     }
 
     if (ops[0].type == RowOperationsPB::EXCLUSIVE_RANGE_LOWER_BOUND) {
@@ -2444,65 +2472,97 @@ Status CatalogManager::ApplyAlterPartitioningSteps(
     }
 
     vector<Partition> partitions;
-    RETURN_NOT_OK(partition_schema.CreatePartitions({}, {{ *ops[0].split_row, *ops[1].split_row }},
-                                                    schema, &partitions));
-
+    RETURN_NOT_OK(partition_schema.CreatePartitions(
+        {}, {{ *ops[0].split_row, *ops[1].split_row }}, schema, &partitions));
     switch (step.type()) {
       case AlterTableRequestPB::ADD_RANGE_PARTITION: {
         for (const Partition& partition : partitions) {
           const string& lower_bound = partition.partition_key_start();
           const string& upper_bound = partition.partition_key_end();
 
-          // Check that the new tablet doesn't overlap with the existing tablets.
-          // Iter points at the tablet directly *after* the lower bound (or to
-          // existing_tablets.end(), if such a tablet does not exist).
-          auto existing_iter = existing_tablets.upper_bound(lower_bound);
+          // Check that the new tablet does not overlap with any of the existing
+          // tablets. Since the elements of 'existing_tablets' are ordered by
+          // the tablets' lower bounds, the iterator points at the tablet
+          // directly *after* the lower bound or to existing_tablets.end()
+          // if such a tablet does not exist.
+          const auto existing_iter = existing_tablets.upper_bound(lower_bound);
           if (existing_iter != existing_tablets.end()) {
-            TabletMetadataLock metadata(existing_iter->second.get(), LockMode::READ);
-            if (upper_bound.empty() ||
-                metadata.data().pb.partition().partition_key_start() < upper_bound) {
+            TabletMetadataLock metadata(existing_iter->second.get(),
+                                        LockMode::READ);
+            const auto& p = metadata.data().pb.partition();
+            // Check for the overlapping ranges.
+            if (upper_bound.empty() || p.partition_key_start() < upper_bound) {
               return Status::InvalidArgument(
-                  "New range partition conflicts with existing range partition",
-                  partition_schema.RangePartitionDebugString(*ops[0].split_row, *ops[1].split_row));
+                  "new range partition conflicts with existing one",
+                  partition_schema.RangePartitionDebugString(*ops[0].split_row,
+                                                             *ops[1].split_row));
             }
           }
+          // This is the case when there is an existing tablet with the lower
+          // bound being less or equal to the lower bound of the new tablet to
+          // create. This cannot be the case of an empty 'existing_tablets'
+          // container (otherwise, existing_tablets.end() would be equal to
+          // existing_tablets.begin()), so it's safe to decrement the iterator
+          // (i.e. call std::prev() on it) and de-reference it.
           if (existing_iter != existing_tablets.begin()) {
             TabletMetadataLock metadata(std::prev(existing_iter)->second.get(),
                                         LockMode::READ);
-            if (metadata.data().pb.partition().partition_key_end().empty() ||
-                metadata.data().pb.partition().partition_key_end() > lower_bound) {
+            const auto& p = metadata.data().pb.partition();
+            // Check for the exact match of ranges.
+            if (lower_bound == p.partition_key_start() &&
+                upper_bound == p.partition_key_end()) {
+              return Status::AlreadyPresent(
+                  "range partition already exists",
+                  partition_schema.RangePartitionDebugString(*ops[0].split_row,
+                                                             *ops[1].split_row));
+            }
+            // Check for the overlapping ranges.
+            if (p.partition_key_end().empty() ||
+                p.partition_key_end() > lower_bound) {
               return Status::InvalidArgument(
-                  "New range partition conflicts with existing range partition",
-                  partition_schema.RangePartitionDebugString(*ops[0].split_row, *ops[1].split_row));
+                  "new range partition conflicts with existing one",
+                  partition_schema.RangePartitionDebugString(*ops[0].split_row,
+                                                             *ops[1].split_row));
             }
           }
 
           // Check that the new tablet doesn't overlap with any other new tablets.
           auto new_iter = new_tablets.upper_bound(lower_bound);
           if (new_iter != new_tablets.end()) {
-            const auto& metadata = new_iter->second->mutable_metadata()->dirty();
-            if (upper_bound.empty() ||
-                metadata.pb.partition().partition_key_start() < upper_bound) {
+            // Check for the overlapping ranges.
+            const auto& p = new_iter->second->mutable_metadata()->dirty().pb.partition();
+            if (upper_bound.empty() || p.partition_key_start() < upper_bound) {
               return Status::InvalidArgument(
-                  "New range partition conflicts with another new range partition",
-                  partition_schema.RangePartitionDebugString(*ops[0].split_row, *ops[1].split_row));
+                  "new range partition conflicts with another newly added one",
+                  partition_schema.RangePartitionDebugString(*ops[0].split_row,
+                                                             *ops[1].split_row));
             }
           }
           if (new_iter != new_tablets.begin()) {
-            const auto& metadata = std::prev(new_iter)->second->mutable_metadata()->dirty();
-            if (metadata.pb.partition().partition_key_end().empty() ||
-                metadata.pb.partition().partition_key_end() > lower_bound) {
+            const auto& p = std::prev(new_iter)->second->mutable_metadata()->dirty().pb.partition();
+            // Check for the exact match of ranges.
+            if (lower_bound == p.partition_key_start() &&
+                upper_bound == p.partition_key_end()) {
+              return Status::AlreadyPresent(
+                  "new range partiton duplicates another newly added one",
+                  partition_schema.RangePartitionDebugString(*ops[0].split_row,
+                                                             *ops[1].split_row));
+            }
+            // Check for the overlapping ranges.
+            if (p.partition_key_end().empty() || p.partition_key_end() > lower_bound) {
               return Status::InvalidArgument(
-                  "New range partition conflicts with another new range partition",
-                  partition_schema.RangePartitionDebugString(*ops[0].split_row, *ops[1].split_row));
+                  "new range partition conflicts with another newly added one",
+                  partition_schema.RangePartitionDebugString(*ops[0].split_row,
+                                                             *ops[1].split_row));
             }
           }
 
-          PartitionPB partition_pb;
-          partition.ToPB(&partition_pb);
-          const optional<string> dimension_label = step.add_range_partition().has_dimension_label()
+          const optional<string> dimension_label =
+              step.add_range_partition().has_dimension_label()
               ? make_optional(step.add_range_partition().dimension_label())
               : none;
+          PartitionPB partition_pb;
+          partition.ToPB(&partition_pb);
           new_tablets.emplace(lower_bound,
                               CreateTabletInfo(table, partition_pb, dimension_label));
         }
@@ -2541,15 +2601,15 @@ Status CatalogManager::ApplyAlterPartitioningSteps(
             new_iter->second->mutable_metadata()->AbortMutation();
             new_tablets.erase(new_iter);
           } else {
-            return Status::InvalidArgument(
-                "No range partition found for drop range partition step",
-                partition_schema.RangePartitionDebugString(*ops[0].split_row, *ops[1].split_row));
+            return Status::InvalidArgument("no range partition to drop",
+                partition_schema.RangePartitionDebugString(*ops[0].split_row,
+                                                           *ops[1].split_row));
           }
         }
         break;
       }
       default: {
-        return Status::InvalidArgument("Unknown alter table range partitioning step",
+        return Status::InvalidArgument("unknown alter table range partitioning step",
                                        SecureShortDebugString(step));
       }
     }
@@ -2621,10 +2681,22 @@ Status CatalogManager::AlterTableRpc(const AlterTableRequestPB& req,
     RETURN_NOT_OK(SchemaFromPB(l.data().pb.schema(), &schema));
 
     // Rename the table in the HMS.
-    RETURN_NOT_OK(SetupError(hms_catalog_->AlterTable(
-            table->id(), l.data().name(), normalized_new_table_name,
-            l.data().owner(), schema),
-        resp, MasterErrorPB::HIVE_METASTORE_ERROR));
+    auto s = hms_catalog_->AlterTable(table->id(),
+                                      l.data().name(),
+                                      normalized_new_table_name,
+                                      GetClusterId(),
+                                      l.data().owner(),
+                                      schema);
+    if (PREDICT_TRUE(s.ok())) {
+      LOG(INFO) << Substitute("renamed table $0 in HMS: new name $1",
+                              table->ToString(), normalized_new_table_name);
+    } else {
+      LOG(WARNING) << Substitute(
+          "failed to rename table $0 in HMS: new name $1: $2",
+          table->ToString(), normalized_new_table_name, s.ToString());
+    }
+    RETURN_NOT_OK(SetupError(
+        std::move(s), resp, MasterErrorPB::HIVE_METASTORE_ERROR));
 
     // Unlock the table, and wait for the notification log listener to handle
     // the alter table event.
@@ -2992,11 +3064,18 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
     // table rename, since we split out the rename portion into its own
     // 'transaction' which is serialized through the HMS.
     DCHECK(!req.has_new_table_name());
-    WARN_NOT_OK(hms_catalog_->AlterTable(
-          table->id(), normalized_table_name, normalized_table_name,
-          l.mutable_data()->owner(), new_schema),
-        Substitute("failed to alter HiveMetastore schema for table $0, "
-                   "HMS schema information will be stale", table->ToString()));
+    auto s = hms_catalog_->AlterTable(
+        table->id(), normalized_table_name, normalized_table_name,
+        GetClusterId(), l.mutable_data()->owner(), new_schema);
+    if (PREDICT_TRUE(s.ok())) {
+      LOG(INFO) << Substitute(
+          "altered HMS schema for table $0", table->ToString());
+    } else {
+      LOG(WARNING) << Substitute(
+          "failed to alter HMS schema for table $0, "
+          "HMS schema information will be stale: $1",
+          table->ToString(), s.ToString());
+    }
   }
 
   if (!tablets_to_add.empty() || has_metadata_changes) {
@@ -3110,15 +3189,28 @@ Status CatalogManager::ListTables(const ListTablesRequestPB* req,
       tables_info.emplace_back(entry.second);
     }
   }
+  unordered_set<int> table_types;
+  for (auto idx = 0; idx < req->type_filter_size(); ++idx) {
+    table_types.emplace(req->type_filter(idx));
+  }
+  if (table_types.empty()) {
+    // The default behavior is to list only user tables (that's backwards
+    // compatible).
+    table_types.emplace(TableTypePB::DEFAULT_TABLE);
+  }
   unordered_map<string, scoped_refptr<TableInfo>> table_info_by_name;
   unordered_map<string, bool> table_owner_map;
   for (const auto& table_info : tables_info) {
     TableMetadataLock ltm(table_info.get(), LockMode::READ);
     const auto& table_data = ltm.data();
-    // Don't list system tables or tables that aren't running
-    // TODO(awong): consider allow for opting into listing system tables.
-    if (!table_data.is_running() ||
-        table_data.pb.table_type() != TableTypePB::DEFAULT_TABLE) {
+    // Don't list tables that aren't running
+    if (!table_data.is_running()) {
+      continue;
+    }
+    // The table type might be unset in the data stored in the system catalog.
+    const auto table_type = table_data.pb.has_table_type()
+        ? table_data.pb.table_type() : TableTypePB::DEFAULT_TABLE;
+    if (!ContainsKey(table_types, table_type)) {
       continue;
     }
 
@@ -4596,6 +4688,11 @@ Status CatalogManager::ProcessTabletReport(
   return Status::OK();
 }
 
+string CatalogManager::GetClusterId() const {
+  std::lock_guard<simple_spinlock> l(cluster_id_lock_);
+  return cluster_id_;
+}
+
 int64_t CatalogManager::GetLatestNotificationLogEventId() {
   DCHECK(hms_catalog_);
   leader_lock_.AssertAcquiredForReading();
@@ -5511,6 +5608,13 @@ const char* CatalogManager::StateToString(State state) {
   __builtin_unreachable();
 }
 
+const char* CatalogManager::ChangeConfigOpToString(ChangeConfigOp type) {
+  switch (type) {
+    case CatalogManager::kAddMaster: return "add";
+  }
+  __builtin_unreachable();
+}
+
 void CatalogManager::ResetTableLocationsCache() {
   const auto cache_capacity_bytes =
       FLAGS_table_locations_cache_capacity_mb * 1024 * 1024;
@@ -5525,6 +5629,56 @@ void CatalogManager::ResetTableLocationsCache() {
     table_locations_cache_ = std::move(new_cache);
   }
   VLOG(1) << "table locations cache has been reset";
+}
+
+Status CatalogManager::InitiateMasterChangeConfig(ChangeConfigOp op, const HostPort& hp,
+                                                  const std::string& uuid, rpc::RpcContext* rpc) {
+  auto consensus = master_consensus();
+  if (!consensus) {
+    return Status::IllegalState("Consensus not running");
+  }
+
+  consensus::ChangeConfigRequestPB req;
+  // Request is targeted to itself, the leader master.
+  req.set_dest_uuid(master_->fs_manager()->uuid());
+  req.set_tablet_id(sys_catalog()->tablet_id());
+  req.set_cas_config_opid_index(consensus->CommittedConfig().opid_index());
+  RaftPeerPB* peer = req.mutable_server();
+  peer->set_permanent_uuid(uuid);
+
+  switch (op) {
+    case CatalogManager::kAddMaster:
+      req.set_type(consensus::ADD_PEER);
+      *peer->mutable_last_known_addr() = HostPortToPB(hp);
+      // Adding the new master as a NON_VOTER that'll be promoted to VOTER once the tablet
+      // copy is complete and is sufficiently caught up.
+      peer->set_member_type(RaftPeerPB::NON_VOTER);
+      peer->mutable_attrs()->set_promote(true);
+      break;
+    default:
+      LOG(FATAL) << "Unsupported ChangeConfig operation: " << op;
+  }
+
+  const string op_str = ChangeConfigOpToString(op);
+  LOG(INFO) << Substitute("Initiating ChangeConfig request to $0 master $1: $2",
+                          op_str, hp.ToString(), SecureDebugString(req));
+  auto completion_cb = [op_str, hp, rpc] (const Status& completion_status) {
+    if (completion_status.ok()) {
+      LOG(INFO) << Substitute("Successfully completed master ChangeConfig request to $0 master $1",
+                              op_str, hp.ToString());
+      rpc->RespondSuccess();
+    } else {
+      LOG(WARNING) << Substitute("ChangeConfig request failed to $0 master $1: $2 ",
+                                 op_str, hp.ToString(), completion_status.ToString());
+      rpc->RespondFailure(completion_status);
+    }
+  };
+  boost::optional<TabletServerErrorPB::Code> err_code;
+  RETURN_NOT_OK_PREPEND(
+      consensus->ChangeConfig(req, completion_cb, &err_code),
+      Substitute("Failed initiating master Raft ChangeConfig request, error: $0",
+                 err_code ? TabletServerErrorPB::Code_Name(*err_code) : "unknown"));
+  return Status::OK();
 }
 
 ////////////////////////////////////////////////////////////
@@ -5647,6 +5801,7 @@ bool CatalogManager::ScopedLeaderSharedLock::CheckIsInitializedAndIsLeaderOrResp
 INITTED_OR_RESPOND(ConnectToMasterResponsePB);
 INITTED_OR_RESPOND(GetMasterRegistrationResponsePB);
 INITTED_OR_RESPOND(TSHeartbeatResponsePB);
+INITTED_AND_LEADER_OR_RESPOND(AddMasterResponsePB);
 INITTED_AND_LEADER_OR_RESPOND(AlterTableResponsePB);
 INITTED_AND_LEADER_OR_RESPOND(ChangeTServerStateResponsePB);
 INITTED_AND_LEADER_OR_RESPOND(CreateTableResponsePB);

@@ -87,6 +87,10 @@ class KuduTest : public ::testing::Test {
 // Returns true if slow tests are runtime-enabled.
 bool AllowSlowTests();
 
+// Returns true if the KUDU_USE_LARGE_KEYS_IN_TESTS environment variable is set
+// to true. This is required to pass certain tests in FIPS approved mode.
+bool UseLargeKeys();
+
 // Override the given gflag to the new value, only in the case that
 // slow tests are enabled and the user hasn't otherwise overridden
 // it on the command line.
@@ -111,6 +115,13 @@ int SeedRandom();
 // May only be called from within a gtest unit test. Prefer KuduTest::test_dir_
 // if a KuduTest instance is available.
 std::string GetTestDataDirectory();
+
+// Returns a unique socket path for use in tests in the form of:
+//   <test-dir>/<name>-<uuid>.sock
+//
+// The path is in the base test directory because the path to Unix domain
+// socket file cannot be longer than ~100 bytes.
+std::string GetTestSocketPath(const std::string& name);
 
 // Return the directory which contains the test's executable.
 std::string GetTestExecutableDirectory();

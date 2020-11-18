@@ -18,6 +18,9 @@
 #include "kudu/security/openssl_util.h"
 
 #include <openssl/crypto.h>
+#if defined(KUDU_OPENSSL_REQUIRE_FIPS_HEADER)
+#include <openssl/fips.h>
+#endif
 #include <openssl/err.h>
 #include <openssl/rand.h> // IWYU pragma: keep
 
@@ -37,12 +40,16 @@
 #include "kudu/util/debug/leakcheck_disabler.h"
 #endif
 #include "kudu/util/errno.h"
+#include "kudu/util/flags.h"
 #if OPENSSL_VERSION_NUMBER < 0x10100000L
 #include "kudu/util/mutex.h"
 #endif
 #include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/status.h"
 #include "kudu/util/subprocess.h"
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+#include "kudu/util/thread.h"
+#endif
 
 using std::ostringstream;
 using std::string;
@@ -84,7 +91,23 @@ void LockingCB(int mode, int type, const char* /*file*/, int /*line*/) {
     m->unlock();
   }
 }
+
+void ThreadIdCB(CRYPTO_THREADID* tid) {
+  CRYPTO_THREADID_set_numeric(tid, Thread::UniqueThreadId());
+}
 #endif
+
+void CheckFIPSMode() {
+  auto fips_mode = FIPS_mode();
+  // If the environment variable KUDU_REQUIRE_FIPS_MODE is set to "1", we
+  // check if FIPS approved mode is enabled. If not, we crash the process.
+  // As this is used in clients as well, we can't use gflags to set this.
+  if (GetBooleanEnvironmentVariable("KUDU_REQUIRE_FIPS_MODE")) {
+    CHECK(fips_mode) << "FIPS mode required by environment variable "
+                        "KUDU_REQUIRE_FIPS_MODE, but it is not enabled.";
+  }
+  VLOG(2) << "FIPS mode is " << (fips_mode ? "enabled" : "disabled.");
+}
 
 Status CheckOpenSSLInitialized() {
 #if OPENSSL_VERSION_NUMBER < 0x10100000L
@@ -117,10 +140,18 @@ Status CheckOpenSSLInitialized() {
         "SSL library appears uninitialized (cannot create SSL_CTX)");
   }
 #endif
+  CheckFIPSMode();
   return Status::OK();
 }
 
 void DoInitializeOpenSSL() {
+  // In case the user's thread has left some error around, clear it.
+  ERR_clear_error();
+  SCOPED_OPENSSL_NO_PENDING_ERRORS;
+  if (g_disable_ssl_init) {
+    VLOG(2) << "Not initializing OpenSSL (disabled by application)";
+    return;
+  }
 #if OPENSSL_VERSION_NUMBER >= 0x10100000L
   // The OPENSSL_init_ssl manpage [1] says "As of version 1.1.0 OpenSSL will
   // automatically allocate all resources it needs so no explicit initialisation
@@ -136,21 +167,8 @@ void DoInitializeOpenSSL() {
   //
   // 1. https://www.openssl.org/docs/man1.1.0/ssl/OPENSSL_init_ssl.html
   // 2. https://github.com/openssl/openssl/issues/5899
-  if (g_disable_ssl_init) {
-    VLOG(2) << "Not initializing OpenSSL (disabled by application)";
-    return;
-  }
   CHECK_EQ(1, OPENSSL_init_ssl(0, nullptr));
-  SCOPED_OPENSSL_NO_PENDING_ERRORS;
 #else
-  // In case the user's thread has left some error around, clear it.
-  ERR_clear_error();
-  SCOPED_OPENSSL_NO_PENDING_ERRORS;
-  if (g_disable_ssl_init) {
-    VLOG(2) << "Not initializing OpenSSL (disabled by application)";
-    return;
-  }
-
   // Check that OpenSSL isn't already initialized. If it is, it's likely
   // we are embedded in (or embedding) another application/library which
   // initializes OpenSSL, and we risk installing conflicting callbacks
@@ -189,9 +207,11 @@ void DoInitializeOpenSSL() {
 
     // Callbacks used by OpenSSL required in a multi-threaded setting.
     CRYPTO_set_locking_callback(LockingCB);
+
+    CRYPTO_THREADID_set_callback(ThreadIdCB);
   }
 #endif
-
+  CheckFIPSMode();
   g_ssl_is_initialized = true;
 }
 

@@ -26,6 +26,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include <gflags/gflags.h>
 #include <glog/logging.h>
 
 #include "kudu/clock/hybrid_clock.h"
@@ -39,6 +40,7 @@
 #include "kudu/common/schema.h"
 #include "kudu/consensus/opid.pb.h"
 #include "kudu/consensus/opid_util.h"
+#include "kudu/fs/error_manager.h"
 #include "kudu/gutil/casts.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/map-util.h"
@@ -55,10 +57,15 @@
 #include "kudu/tablet/tablet.pb.h"
 #include "kudu/util/debug/trace_event.h"
 #include "kudu/util/faststring.h"
+#include "kudu/util/fault_injection.h"
+#include "kudu/util/flag_tags.h"
 #include "kudu/util/memory/arena.h"
 
 using kudu::clock::HybridClock;
+using kudu::fault_injection::MaybeTrue;
 using kudu::fs::IOContext;
+using kudu::fs::FsErrorManager;
+using kudu::fs::KUDU_2233_CORRUPTION;
 using std::deque;
 using std::shared_ptr;
 using std::string;
@@ -66,6 +73,12 @@ using std::unique_ptr;
 using std::unordered_set;
 using std::vector;
 using strings::Substitute;
+
+DEFINE_double(tablet_inject_kudu_2233, 0,
+              "Fraction of the time that compactions that merge the history "
+              "of a single row spread across multiple rowsets will return "
+              "with a corruption status");
+TAG_FLAG(tablet_inject_kudu_2233, hidden);
 
 namespace kudu {
 namespace tablet {
@@ -91,7 +104,7 @@ class MemRowSetCompactionInput : public CompactionInput {
   MemRowSetCompactionInput(const MemRowSet& memrowset,
                            const MvccSnapshot& snap,
                            const Schema* projection)
-    : arena_(32*1024),
+    : mem_(32*1024),
       has_more_blocks_(false) {
     RowIteratorOptions opts;
     opts.projection = projection;
@@ -116,10 +129,10 @@ class MemRowSetCompactionInput : public CompactionInput {
     // Realloc the internal block storage if we don't have enough space to
     // copy the whole leaf node's worth of data into it.
     if (PREDICT_FALSE(!row_block_ || num_in_block > row_block_->nrows())) {
-      row_block_.reset(new RowBlock(&iter_->schema(), num_in_block, nullptr));
+      row_block_.reset(new RowBlock(&iter_->schema(), num_in_block, &mem_));
     }
 
-    arena_.Reset();
+    mem_.arena.Reset();
     RowChangeListEncoder undo_encoder(&buffer_);
     int next_row_index = 0;
     for (int i = 0; i < num_in_block; ++i) {
@@ -130,7 +143,7 @@ class MemRowSetCompactionInput : public CompactionInput {
       RETURN_NOT_OK(iter_->GetCurrentRow(&input_row.row,
                                          static_cast<Arena*>(nullptr),
                                          &input_row.redo_head,
-                                         &arena_,
+                                         &mem_.arena,
                                          &insertion_timestamp));
 
       // Handle the rare case where a row was inserted and deleted in the same operation.
@@ -152,7 +165,7 @@ class MemRowSetCompactionInput : public CompactionInput {
 
       // Materialize MRSRow undo insert (delete)
       undo_encoder.SetToDelete();
-      input_row.undo_head = Mutation::CreateInArena(&arena_,
+      input_row.undo_head = Mutation::CreateInArena(&mem_.arena,
                                                     insertion_timestamp,
                                                     undo_encoder.as_changelist());
       undo_encoder.Reset();
@@ -168,7 +181,7 @@ class MemRowSetCompactionInput : public CompactionInput {
     return Status::OK();
   }
 
-  Arena* PreparedBlockArena() override { return &arena_; }
+  Arena* PreparedBlockArena() override { return &mem_.arena; }
 
   Status FinishBlock() override {
     return Status::OK();
@@ -184,8 +197,8 @@ class MemRowSetCompactionInput : public CompactionInput {
 
   unique_ptr<MemRowSet::Iterator> iter_;
 
-  // Arena used to store the projected undo/redo mutations of the current block.
-  Arena arena_;
+  // Memory used to store the projected undo/redo mutations of the current block.
+  RowBlockMemory mem_;
 
   faststring buffer_;
 
@@ -415,7 +428,7 @@ class MergeCompactionInput : public CompactionInput {
                        const Schema* schema)
     : schema_(schema),
       num_dup_rows_(0) {
-    for (const shared_ptr<CompactionInput> &input : inputs) {
+    for (const shared_ptr<CompactionInput>& input : inputs) {
       unique_ptr<MergeState> state(new MergeState);
       state->input = input;
       states_.push_back(state.release());
@@ -489,8 +502,9 @@ class MergeCompactionInput : public CompactionInput {
                    << CompactionInputRowToString(*smallest);
           continue;
         }
-        // If we found two rows with the same key, we want to make the newer one point to the older
-        // one, which must be a ghost.
+
+        // If we found two rows with the same key, we want to make the newer
+        // one point to the older one, which must be a ghost.
         if (PREDICT_FALSE(row_comp == 0)) {
           DVLOG(4) << "Duplicate row.\nLeft: " << CompactionInputRowToString(*state->next())
                    << "\nRight: " << CompactionInputRowToString(*smallest);
@@ -510,7 +524,7 @@ class MergeCompactionInput : public CompactionInput {
           }
           // .. otherwise copy and pop the other one.
           RETURN_NOT_OK(SetPreviousGhost(smallest, state->next(), true /* clone */,
-                                         smallest->row.row_block()->arena()));
+                                         DCHECK_NOTNULL(smallest)->row.row_block()->arena()));
           DVLOG(4) << "Updated left duplicate smallest: "
                    << CompactionInputRowToString(*smallest);
           states_[i]->pop_front();
@@ -559,8 +573,13 @@ class MergeCompactionInput : public CompactionInput {
 
       // If an input is fully exhausted, no need to consider it
       // in the merge anymore.
-      if (!state->input->HasMoreBlocks()) {
-
+      bool has_blocks = state->input->HasMoreBlocks();
+      if (has_blocks) {
+        state->Reset();
+        RETURN_NOT_OK(state->input->PrepareBlock(&state->pending));
+        has_blocks = !state->empty();
+      }
+      if (!has_blocks) {
         // Any inputs that were dominated by the last block of this input
         // need to be re-added into the merge.
         states_.insert(states_.end(), state->dominated.begin(), state->dominated.end());
@@ -569,9 +588,6 @@ class MergeCompactionInput : public CompactionInput {
         j--;
         continue;
       }
-
-      state->Reset();
-      RETURN_NOT_OK(state->input->PrepareBlock(&state->pending));
 
       // Now that this input has moved to its next block, it's possible that
       // it no longer dominates the inputs in it 'dominated' list. Re-check
@@ -645,8 +661,12 @@ class MergeCompactionInput : public CompactionInput {
     return Status::OK();
   }
 
-  // Sets the previous ghost row for a CompactionInputRow.
-  // 'must_copy' indicates whether there must be a deep copy (using CloneCompactionInputRow()).
+  // Merges the 'previous_ghost' histories of 'older' and 'newer' such that
+  // 'older->previous_ghost' is the head of a list of rows in increasing
+  // timestamp order (deltas get newer down the list).
+  //
+  // 'must_copy' indicates whether there must be a deep copy (using
+  // CloneCompactionInputRow()).
   Status SetPreviousGhost(CompactionInputRow* older,
                           CompactionInputRow* newer,
                           bool must_copy,
@@ -656,7 +676,7 @@ class MergeCompactionInput : public CompactionInput {
     // recent.
     if (older->previous_ghost != nullptr) {
       if (CompareDuplicatedRows(*older->previous_ghost, *newer) > 0) {
-        // 'older' was more recent.
+        // 'older->previous_ghost' was more recent.
         return SetPreviousGhost(older->previous_ghost, newer, must_copy /* clone */, arena);
       }
       // 'newer' was more recent.
@@ -753,9 +773,11 @@ Mutation* MergeUndoHistories(Mutation* left, Mutation* right) {
   return head;
 }
 
-// If 'old_row' has previous versions, this transforms prior version in undos and adds them
-// to 'new_undo_head'.
-Status MergeDuplicatedRowHistory(CompactionInputRow* old_row,
+// If 'old_row' has previous versions, this transforms prior version in undos
+// and adds them to 'new_undo_head'.
+Status MergeDuplicatedRowHistory(const string& tablet_id,
+                                 const FsErrorManager* error_manager,
+                                 CompactionInputRow* old_row,
                                  Mutation** new_undo_head,
                                  Arena* arena) {
   if (PREDICT_TRUE(old_row->previous_ghost == nullptr)) return Status::OK();
@@ -786,9 +808,17 @@ Status MergeDuplicatedRowHistory(CompactionInputRow* old_row,
                                                  &previous_ghost->row));
 
     // We should be left with only one redo, the delete.
-    CHECK(pv_delete_redo != nullptr);
-    CHECK(pv_delete_redo->changelist().is_delete());
-    CHECK(pv_delete_redo->next() == nullptr);
+    DCHECK(pv_delete_redo != nullptr);
+    DCHECK(pv_delete_redo->changelist().is_delete());
+    DCHECK(pv_delete_redo->next() == nullptr);
+    if (PREDICT_FALSE(
+        pv_delete_redo == nullptr ||
+        !pv_delete_redo->changelist().is_delete() ||
+        pv_delete_redo->next() ||
+        MaybeTrue(FLAGS_tablet_inject_kudu_2233))) {
+      error_manager->RunErrorNotificationCb(KUDU_2233_CORRUPTION, tablet_id);
+      return Status::Corruption("data was corrupted in a version prior to Kudu 1.7.0");
+    }
 
     // Now transform the redo delete into an undo (reinsert), which will contain the previous
     // ghost. The reinsert will have the timestamp of the delete.
@@ -969,6 +999,12 @@ void RemoveAncientUndos(const HistoryGcOpts& history_gc_opts,
   }
 }
 
+// Applies the REDOs of 'src_row' in accordance with the input snapshot,
+// returning the result in 'dst_row', and converting those REDOs to UNDOs,
+// returned via 'new_undo_head' and any remaining REDO (e.g. a delete) in
+// 'new_redo_head'.
+//
+// NOTE: input REDOs are expected to be in increasing timestamp order.
 Status ApplyMutationsAndGenerateUndos(const MvccSnapshot& snap,
                                       const CompactionInputRow& src_row,
                                       Mutation** new_undo_head,
@@ -1094,7 +1130,9 @@ Status ApplyMutationsAndGenerateUndos(const MvccSnapshot& snap,
   #undef ERROR_LOG_CONTEXT
 }
 
-Status FlushCompactionInput(CompactionInput* input,
+Status FlushCompactionInput(const string& tablet_id,
+                            const FsErrorManager* error_manager,
+                            CompactionInput* input,
                             const MvccSnapshot& snap,
                             const HistoryGcOpts& history_gc_opts,
                             RollingDiskRowSetWriter* out) {
@@ -1127,6 +1165,8 @@ Status FlushCompactionInput(CompactionInput* input,
       Mutation* new_undos_head = nullptr;
       Mutation* new_redos_head = nullptr;
 
+      // Apply all REDOs to the base row, generating UNDOs for it. This does
+      // not take into account any 'previous_ghost' members.
       RETURN_NOT_OK(ApplyMutationsAndGenerateUndos(snap,
                                                    *input_row,
                                                    &new_undos_head,
@@ -1135,7 +1175,9 @@ Status FlushCompactionInput(CompactionInput* input,
                                                    &dst_row));
 
       // Merge the histories of 'input_row' with previous ghosts, if there are any.
-      RETURN_NOT_OK(MergeDuplicatedRowHistory(input_row,
+      RETURN_NOT_OK(MergeDuplicatedRowHistory(tablet_id,
+                                              error_manager,
+                                              input_row,
                                               &new_undos_head,
                                               input->PreparedBlockArena()));
 

@@ -51,7 +51,6 @@ DEFINE_int32(safe_time_max_lag_ms, 30 * 1000,
 TAG_FLAG(safe_time_max_lag_ms, experimental);
 
 DECLARE_int32(raft_heartbeat_interval_ms);
-DECLARE_int32(scanner_max_wait_ms);
 
 using kudu::clock::Clock;
 using std::string;
@@ -136,6 +135,19 @@ Status TimeManager::MessageReceivedFromLeader(const ReplicateMsg& message) {
       last_serial_ts_assigned_ = t;
     }
   }
+  return Status::OK();
+}
+
+Status TimeManager::UpdateClockAndLastAssignedTimestamp(const Timestamp& timestamp) {
+  RETURN_NOT_OK(clock_->Update(timestamp));
+  Lock l(lock_);
+  if (PREDICT_FALSE(mode_ == NON_LEADER)) {
+    return Status::IllegalState(Substitute(
+        "Cannot bump the last assigned timestamp. Tablet is not "
+        "in leader mode. Last heard from a leader: $0 ago.",
+        (MonoTime::Now() - last_advanced_safe_time_).ToString()));
+  }
+  last_serial_ts_assigned_ = std::max(timestamp, last_serial_ts_assigned_);
   return Status::OK();
 }
 

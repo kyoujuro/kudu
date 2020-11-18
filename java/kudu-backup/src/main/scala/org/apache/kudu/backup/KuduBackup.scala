@@ -17,8 +17,6 @@
 
 package org.apache.kudu.backup
 
-import scala.concurrent.forkjoin.ForkJoinPool
-
 import org.apache.kudu.spark.kudu.KuduContext
 import org.apache.spark.sql.SaveMode
 import org.apache.spark.sql.SparkSession
@@ -28,6 +26,7 @@ import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import scala.collection.JavaConverters._
 import scala.collection.parallel.ForkJoinTaskSupport
+import scala.concurrent.forkjoin.ForkJoinPool
 import scala.util.Failure
 import scala.util.Success
 import scala.util.Try
@@ -82,6 +81,11 @@ object KuduBackup {
     val df =
       session.sqlContext
         .createDataFrame(rdd, BackupUtils.dataSchema(table.getSchema, incremental))
+
+    // Ensure maximum compatibility for dates before 1582-10-15 or timestamps before
+    // 1900-01-01T00:00:00Z in Parquet. Otherwise incorrect values may be read by
+    // Spark 2 or legacy version of Hive. See more details in SPARK-31404.
+    session.conf.set("spark.sql.legacy.parquet.datetimeRebaseModeInWrite", "LEGACY")
 
     // Write the data to the backup path.
     // The backup path contains the timestampMs and should not already exist.

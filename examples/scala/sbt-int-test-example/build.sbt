@@ -18,7 +18,7 @@
 
 import sbt._
 
-ThisBuild / scalaVersion := "2.12.10"
+ThisBuild / scalaVersion := "2.12.12"
 ThisBuild / version := "0.1.0-SNAPSHOT"
 ThisBuild / organization := "org.apache.kudu"
 ThisBuild / organizationName := "Apache Kudu"
@@ -29,9 +29,9 @@ lazy val root = (project in file("."))
   .settings(
     Defaults.itSettings,
     name := "sbt-int-test-example",
-    libraryDependencies += "org.scalatest" %% "scalatest" % "3.0.8" % "it,test",
-    libraryDependencies += "org.apache.kudu" % "kudu-client" % "1.12.0",
-    libraryDependencies += "org.apache.kudu" % "kudu-test-utils" % "1.12.0" % "it",
-    libraryDependencies += "org.apache.kudu" % "kudu-binary" % "1.12.0" % "it" classifier osDetectorClassifier.value,
+    libraryDependencies += "org.scalatest" %% "scalatest" % "3.2.2" % "it,test",
+    libraryDependencies += "org.apache.kudu" % "kudu-client" % "1.13.0",
+    libraryDependencies += "org.apache.kudu" % "kudu-test-utils" % "1.13.0" % "it",
+    libraryDependencies += "org.apache.kudu" % "kudu-binary" % "1.13.0" % "it" classifier osDetectorClassifier.value,
     libraryDependencies += "ch.qos.logback" % "logback-classic" % "1.2.3",
   )

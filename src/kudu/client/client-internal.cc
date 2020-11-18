@@ -73,7 +73,34 @@ DECLARE_int32(dns_resolver_max_threads_num);
 DECLARE_uint32(dns_resolver_cache_capacity_mb);
 DECLARE_uint32(dns_resolver_cache_ttl_sec);
 
+
 using boost::container::small_vector;
+using kudu::client::internal::AsyncLeaderMasterRpc;
+using kudu::client::internal::ConnectToClusterRpc;
+using kudu::client::internal::RemoteTablet;
+using kudu::client::internal::RemoteTabletServer;
+using kudu::master::AlterTableRequestPB;
+using kudu::master::AlterTableResponsePB;
+using kudu::master::ConnectToMasterResponsePB;
+using kudu::master::CreateTableRequestPB;
+using kudu::master::CreateTableResponsePB;
+using kudu::master::DeleteTableRequestPB;
+using kudu::master::DeleteTableResponsePB;
+using kudu::master::GetTableSchemaRequestPB;
+using kudu::master::GetTableSchemaResponsePB;
+using kudu::master::IsAlterTableDoneRequestPB;
+using kudu::master::IsAlterTableDoneResponsePB;
+using kudu::master::IsCreateTableDoneRequestPB;
+using kudu::master::IsCreateTableDoneResponsePB;
+using kudu::master::ListTabletServersRequestPB;
+using kudu::master::ListTabletServersResponsePB;
+using kudu::master::MasterFeatures;
+using kudu::master::MasterServiceProxy;
+using kudu::master::TableIdentifierPB;
+using kudu::rpc::BackoffType;
+using kudu::rpc::CredentialsPolicy;
+using kudu::rpc::MessengerBuilder;
+using kudu::security::SignedTokenPB;
 using std::map;
 using std::pair;
 using std::set;
@@ -81,6 +108,7 @@ using std::shared_ptr;
 using std::string;
 using std::unique_ptr;
 using std::vector;
+using strings::Substitute;
 
 namespace kudu {
 
@@ -88,35 +116,7 @@ namespace security {
 class SignedTokenPB;
 } // namespace security
 
-using master::AlterTableRequestPB;
-using master::AlterTableResponsePB;
-using master::ConnectToMasterResponsePB;
-using master::CreateTableRequestPB;
-using master::CreateTableResponsePB;
-using master::DeleteTableRequestPB;
-using master::DeleteTableResponsePB;
-using master::GetTableSchemaRequestPB;
-using master::GetTableSchemaResponsePB;
-using master::IsAlterTableDoneRequestPB;
-using master::IsAlterTableDoneResponsePB;
-using master::IsCreateTableDoneRequestPB;
-using master::IsCreateTableDoneResponsePB;
-using master::ListTabletServersResponsePB;
-using master::ListTabletServersRequestPB;
-using master::MasterFeatures;
-using master::MasterServiceProxy;
-using master::TableIdentifierPB;
-using rpc::BackoffType;
-using rpc::CredentialsPolicy;
-using security::SignedTokenPB;
-using strings::Substitute;
-
 namespace client {
-
-using internal::AsyncLeaderMasterRpc;
-using internal::ConnectToClusterRpc;
-using internal::RemoteTablet;
-using internal::RemoteTabletServer;
 
 Status RetryFunc(const MonoTime& deadline,
                  const string& retry_msg,
@@ -560,7 +560,7 @@ Status KuduClient::Data::GetTableSchema(KuduClient* client,
   rpc.SendRpc();
   RETURN_NOT_OK(sync.Wait());
   // Parse the server schema out of the response.
-  unique_ptr<Schema> new_schema(new Schema());
+  unique_ptr<Schema> new_schema(new Schema);
   RETURN_NOT_OK(SchemaFromPB(resp.schema(), new_schema.get()));
 
   // Parse the server partition schema out of the response.
@@ -660,8 +660,10 @@ void KuduClient::Data::ConnectedToClusterCb(
       hive_metastore_uuid_ = hive_config.hms_uuid();
 
       location_ = connect_response.client_location();
+      cluster_id_ = connect_response.cluster_id();
 
-      master_proxy_.reset(new MasterServiceProxy(messenger_, leader_addr, leader_hostname));
+      master_proxy_ = std::make_shared<MasterServiceProxy>(
+          messenger_, leader_addr, leader_hostname);
       master_proxy_->set_user_credentials(user_credentials_);
     }
   }
@@ -684,6 +686,10 @@ void KuduClient::Data::ConnectToClusterAsync(KuduClient* client,
                                              const StatusCallback& cb,
                                              CredentialsPolicy creds_policy) {
   DCHECK(deadline.Initialized());
+
+  if (master_server_addrs_.empty()) {
+    cb(Status::InvalidArgument("no master address specified"));
+  }
 
   vector<pair<Sockaddr, string>> master_addrs_with_names;
   for (const string& master_server_addr : master_server_addrs_) {
@@ -808,6 +814,11 @@ vector<HostPort> KuduClient::Data::master_hostports() const {
 string KuduClient::Data::location() const {
   std::lock_guard<simple_spinlock> l(leader_master_lock_);
   return location_;
+}
+
+string KuduClient::Data::cluster_id() const {
+  std::lock_guard<simple_spinlock> l(leader_master_lock_);
+  return cluster_id_;
 }
 
 shared_ptr<master::MasterServiceProxy> KuduClient::Data::master_proxy() const {

@@ -291,12 +291,13 @@ class TestCompaction : public KuduRowSetTest {
                                 Tablet::DefaultBloomSizing(),
                                 roll_threshold);
     ASSERT_OK(rsw.Open());
-    ASSERT_OK(FlushCompactionInput(input, snap, HistoryGcOpts::Disabled(), &rsw));
+    ASSERT_OK(FlushCompactionInput(tablet()->metadata()->tablet_id(),
+                                   fs_manager()->block_manager()->error_manager(),
+                                   input, snap, HistoryGcOpts::Disabled(), &rsw));
     ASSERT_OK(rsw.Finish());
 
     vector<shared_ptr<RowSetMetadata> > metas;
     rsw.GetWrittenRowSetMetadata(&metas);
-    ASSERT_GE(metas.size(), 1);
     for (const shared_ptr<RowSetMetadata>& meta : metas) {
       ASSERT_TRUE(meta->HasBloomDataBlockForTests());
     }
@@ -368,6 +369,31 @@ class TestCompaction : public KuduRowSetTest {
     FlushMRSAndReopen(mrs, projection, kLargeRollThreshold, &rowsets);
     ASSERT_EQ(1, rowsets.size());
     *result_rs = rowsets[0];
+  }
+
+  // Create an invisible MRS -- one whose inserts and deletes were applied at
+  // the same timestamp.
+  shared_ptr<MemRowSet> CreateInvisibleMRS() {
+    shared_ptr<MemRowSet> mrs;
+    CHECK_OK(MemRowSet::Create(0, schema_, log_anchor_registry_.get(),
+                               mem_trackers_.tablet_tracker, &mrs));
+    ScopedOp op(&mvcc_, clock_.Now());
+    op.StartApplying();
+    InsertRowInOp(mrs.get(), op, 0, 0);
+    DeleteRowInOp(mrs.get(), op, 0);
+    op.FinishApplying();
+    return mrs;
+  }
+
+  // Count the number of rows in the given rowsets.
+  static uint64_t CountRows(const vector<shared_ptr<DiskRowSet>>& rowsets) {
+    uint64_t total_num_rows = 0;
+    for (const auto& rs : rowsets) {
+      uint64_t rs_live_rows;
+      CHECK_OK(rs->CountLiveRows(&rs_live_rows));
+      total_num_rows += rs_live_rows;
+    }
+    return total_num_rows;
   }
 
   // Test compaction where each of the input rowsets has
@@ -467,7 +493,9 @@ class TestCompaction : public KuduRowSetTest {
                                     Tablet::DefaultBloomSizing(),
                                     1024 * 1024); // 1 MB
       ASSERT_OK(rdrsw.Open());
-      ASSERT_OK(FlushCompactionInput(compact_input.get(), merge_snap, HistoryGcOpts::Disabled(),
+      ASSERT_OK(FlushCompactionInput(tablet()->metadata()->tablet_id(),
+                                     fs_manager()->block_manager()->error_manager(),
+                                     compact_input.get(), merge_snap, HistoryGcOpts::Disabled(),
                                      &rdrsw));
       ASSERT_OK(rdrsw.Finish());
     }
@@ -1022,9 +1050,7 @@ TEST_F(TestCompaction, TestMergeMultipleSchemas) {
   DoMerge(schemas.back(), schemas);
 }
 
-// Test MergeCompactionInput against MemRowSets. This behavior isn't currently
-// used (we never compact in-memory), but this is a regression test for a bug
-// encountered during development where the first row of each MRS got dropped.
+// Test MergeCompactionInput against MemRowSets.
 TEST_F(TestCompaction, TestMergeMRS) {
   shared_ptr<MemRowSet> mrs_a;
   ASSERT_OK(MemRowSet::Create(0, schema_, log_anchor_registry_.get(),
@@ -1036,23 +1062,59 @@ TEST_F(TestCompaction, TestMergeMRS) {
                               mem_trackers_.tablet_tracker, &mrs_b));
   InsertRows(mrs_b.get(), 10, 1);
 
-  MvccSnapshot snap(mvcc_);
-  vector<shared_ptr<CompactionInput> > merge_inputs;
-  merge_inputs.push_back(
-        shared_ptr<CompactionInput>(CompactionInput::Create(*mrs_a, &schema_, snap)));
-  merge_inputs.push_back(
-        shared_ptr<CompactionInput>(CompactionInput::Create(*mrs_b, &schema_, snap)));
-  unique_ptr<CompactionInput> input(CompactionInput::Merge(merge_inputs, &schema_));
+  // While we're at it, let's strew some rows' histories across both rowsets.
+  // This will create ghost rows in the compaction inputs and help validate
+  // some of the ghost-row handling applied during compaction.
+  DeleteRows(mrs_a.get(), 5, 0);
+  InsertRows(mrs_b.get(), 5, 0);
+  DeleteRows(mrs_b.get(), 5, 1);
+  InsertRows(mrs_a.get(), 5, 1);
 
-  vector<string> out;
-  IterateInput(input.get(), &out);
-  ASSERT_EQ(out.size(), 20);
-  EXPECT_EQ(R"(RowIdxInBlock: 0; Base: (string key="hello 00000000", int32 val=0, )"
-                "int32 nullable_val=0); Undo Mutations: [@1(DELETE)]; "
-                "Redo Mutations: [];", out[0]);
-  EXPECT_EQ(R"(RowIdxInBlock: 9; Base: (string key="hello 00000091", int32 val=9, )"
-                "int32 nullable_val=NULL); Undo Mutations: [@20(DELETE)]; "
-                "Redo Mutations: [];", out[19]);
+  MvccSnapshot snap(mvcc_);
+  vector<shared_ptr<CompactionInput> > merge_inputs {
+    shared_ptr<CompactionInput>(CompactionInput::Create(*mrs_a, &schema_, snap)),
+    shared_ptr<CompactionInput>(CompactionInput::Create(*mrs_b, &schema_, snap))
+  };
+  unique_ptr<CompactionInput> input(CompactionInput::Merge(merge_inputs, &schema_));
+  vector<shared_ptr<DiskRowSet>> result_rs;
+  DoFlushAndReopen(input.get(), schema_, snap, kSmallRollThreshold, &result_rs);
+  uint64_t total_num_rows = CountRows(result_rs);
+  ASSERT_EQ(20, total_num_rows);
+}
+
+// Test MergeCompactionInput against MemRowSets, where there are rows that were
+// inserted and deleted in the same op, and can thus never be seen.
+TEST_F(TestCompaction, TestMergeMRSWithInvisibleRows) {
+  shared_ptr<MemRowSet> mrs_a = CreateInvisibleMRS();
+  shared_ptr<MemRowSet> mrs_b;
+  ASSERT_OK(MemRowSet::Create(1, schema_, log_anchor_registry_.get(),
+                              mem_trackers_.tablet_tracker, &mrs_b));
+  InsertRows(mrs_b.get(), 10, 0);
+  MvccSnapshot snap(mvcc_);
+  vector<shared_ptr<CompactionInput> > merge_inputs {
+    shared_ptr<CompactionInput>(CompactionInput::Create(*mrs_a, &schema_, snap)),
+    shared_ptr<CompactionInput>(CompactionInput::Create(*mrs_b, &schema_, snap))
+  };
+  unique_ptr<CompactionInput> input(CompactionInput::Merge(merge_inputs, &schema_));
+  vector<shared_ptr<DiskRowSet>> result_rs;
+  DoFlushAndReopen(input.get(), schema_, snap, kSmallRollThreshold, &result_rs);
+  ASSERT_EQ(1, result_rs.size());
+  ASSERT_EQ(10, CountRows(result_rs));
+}
+
+// Like the above test, but with all invisible rowsets.
+TEST_F(TestCompaction, TestMergeMRSWithAllInvisibleRows) {
+  shared_ptr<MemRowSet> mrs_a = CreateInvisibleMRS();
+  shared_ptr<MemRowSet> mrs_b = CreateInvisibleMRS();
+  MvccSnapshot snap(mvcc_);
+  vector<shared_ptr<CompactionInput> > merge_inputs {
+    shared_ptr<CompactionInput>(CompactionInput::Create(*mrs_a, &schema_, snap)),
+    shared_ptr<CompactionInput>(CompactionInput::Create(*mrs_b, &schema_, snap))
+  };
+  unique_ptr<CompactionInput> input(CompactionInput::Merge(merge_inputs, &schema_));
+  vector<shared_ptr<DiskRowSet>> result_rs;
+  DoFlushAndReopen(input.get(), schema_, snap, kSmallRollThreshold, &result_rs);
+  ASSERT_TRUE(result_rs.empty());
 }
 
 #ifdef NDEBUG

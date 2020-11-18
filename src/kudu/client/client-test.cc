@@ -45,6 +45,7 @@
 #include <google/protobuf/util/message_differencer.h>
 #include <gtest/gtest.h>
 
+#include "kudu/client/batcher.h"
 #include "kudu/client/callbacks.h"
 #include "kudu/client/client-internal.h"
 #include "kudu/client/client-test-util.h"
@@ -70,6 +71,7 @@
 #include "kudu/common/row.h"
 #include "kudu/common/schema.h"
 #include "kudu/common/timestamp.h"
+#include "kudu/common/txn_id.h"
 #include "kudu/common/wire_protocol.pb.h"
 #include "kudu/gutil/atomicops.h"
 #include "kudu/gutil/casts.h"
@@ -82,6 +84,7 @@
 #include "kudu/gutil/stringprintf.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/integration-tests/cluster_itest_util.h"
 #include "kudu/integration-tests/data_gen_util.h"
 #include "kudu/master/catalog_manager.h"
 #include "kudu/master/master.h"
@@ -176,9 +179,11 @@ using boost::none;
 using google::protobuf::util::MessageDifferencer;
 using kudu::cluster::InternalMiniCluster;
 using kudu::cluster::InternalMiniClusterOptions;
+using kudu::itest::GetClusterId;
 using kudu::master::CatalogManager;
 using kudu::master::GetTableLocationsRequestPB;
 using kudu::master::GetTableLocationsResponsePB;
+using kudu::rpc::MessengerBuilder;
 using kudu::security::SignedTokenPB;
 using kudu::client::sp::shared_ptr;
 using kudu::tablet::TabletReplica;
@@ -409,10 +414,24 @@ class ClientTest : public KuduTest {
   }
 
   static unique_ptr<KuduInsertIgnore> BuildTestInsertIgnore(KuduTable* table, int index) {
-    unique_ptr<KuduInsertIgnore> insert(table->NewInsertIgnore());
-    KuduPartialRow* row = insert->mutable_row();
+    unique_ptr<KuduInsertIgnore> insert_ignore(table->NewInsertIgnore());
+    KuduPartialRow* row = insert_ignore->mutable_row();
     PopulateDefaultRow(row, index);
-    return insert;
+    return insert_ignore;
+  }
+
+  static unique_ptr<KuduUpdateIgnore> BuildTestUpdateIgnore(KuduTable* table, int index) {
+    unique_ptr<KuduUpdateIgnore> update_ignore(table->NewUpdateIgnore());
+    KuduPartialRow* row = update_ignore->mutable_row();
+    PopulateDefaultRow(row, index);
+    return update_ignore;
+  }
+
+  static unique_ptr<KuduDeleteIgnore> BuildTestDeleteIgnore(KuduTable* table, int index) {
+    unique_ptr<KuduDeleteIgnore> delete_ignore(table->NewDeleteIgnore());
+    KuduPartialRow* row = delete_ignore->mutable_row();
+    CHECK_OK(row->SetInt32(0, index));
+    return delete_ignore;
   }
 
   static void PopulateDefaultRow(KuduPartialRow* row, int index) {
@@ -786,6 +805,17 @@ class ClientTest : public KuduTest {
 const char *ClientTest::kTableName = "client-testtb";
 const int32_t ClientTest::kNoBound = kint32max;
 
+TEST_F(ClientTest, TestClusterId) {
+  int leader_idx;
+  ASSERT_OK(cluster_->GetLeaderMasterIndex(&leader_idx));
+  string cluster_id;
+  ASSERT_OK(GetClusterId(cluster_->master_proxy(leader_idx),
+                         MonoDelta::FromSeconds(30),
+                         &cluster_id));
+  ASSERT_TRUE(!cluster_id.empty());
+  ASSERT_EQ(cluster_id, client_->cluster_id());
+}
+
 TEST_F(ClientTest, TestListTables) {
   const char* kTable2Name = "client-testtb2";
   shared_ptr<KuduTable> second_table;
@@ -842,6 +872,52 @@ TEST_F(ClientTest, TestBadTable) {
   Status s = client_->OpenTable("xxx-does-not-exist", &t);
   ASSERT_TRUE(s.IsNotFound());
   ASSERT_STR_CONTAINS(s.ToString(), "Not found: the table does not exist");
+}
+
+// If no master address is specified, KuduClientBuilder::Build() should
+// immediately return corresponding status code instead of stalling with
+// ConnectToCluster() for a long time.
+TEST_F(ClientTest, ConnectToClusterNoMasterAddressSpecified) {
+  shared_ptr<KuduClient> c;
+  KuduClientBuilder b;
+  auto s = b.Build(&c);
+  ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+  ASSERT_STR_CONTAINS(s.ToString(), "no master address specified");
+}
+
+// Verify setting of the connection negotiation timeout (KUDU-2966).
+TEST_F(ClientTest, ConnectionNegotiationTimeout) {
+  const auto master_addr = cluster_->mini_master()->bound_rpc_addr().ToString();
+
+  // The connection negotiation timeout isn't set explicitly: it should be
+  // equal to the default setting for the RPC messenger.
+  {
+    KuduClientBuilder b;
+    b.add_master_server_addr(master_addr);
+    shared_ptr<KuduClient> c;
+    ASSERT_OK(b.Build(&c));
+    auto t = c->connection_negotiation_timeout();
+    ASSERT_TRUE(t.Initialized());
+    ASSERT_EQ(MessengerBuilder::kRpcNegotiationTimeoutMs, t.ToMilliseconds());
+    auto t_ms = c->data_->messenger_->rpc_negotiation_timeout_ms();
+    ASSERT_EQ(t_ms, t.ToMilliseconds());
+  }
+
+  // The connection negotiation timeout is set explicitly via KuduBuilder. It
+  // should be propagated to the RPC messenger and reported back correspondingly
+  // by the KuduClient::connection_negotiaton_timeout() method.
+  {
+    const MonoDelta kNegotiationTimeout = MonoDelta::FromMilliseconds(12321);
+    KuduClientBuilder b;
+    b.add_master_server_addr(master_addr);
+    b.connection_negotiation_timeout(kNegotiationTimeout);
+    shared_ptr<KuduClient> c;
+    ASSERT_OK(b.Build(&c));
+    auto t = c->connection_negotiation_timeout();
+    ASSERT_EQ(kNegotiationTimeout, t);
+    auto t_ms = c->data_->messenger_->rpc_negotiation_timeout_ms();
+    ASSERT_EQ(t_ms, t.ToMilliseconds());
+  }
 }
 
 // Test that, if the master is down, we experience a network error talking
@@ -2483,7 +2559,7 @@ TEST_F(ClientTest, TestInsertSingleRowManualBatch) {
   FlushSessionOrDie(session);
 }
 
-static void DoTestInsertIgnoreVerifyRows(const shared_ptr<KuduTable>& tbl, int num_rows) {
+static void DoTestVerifyRows(const shared_ptr<KuduTable>& tbl, int num_rows) {
   vector<string> rows;
   KuduScanner scanner(tbl.get());
   ASSERT_OK(ScanToStrings(&scanner, &rows));
@@ -2503,32 +2579,94 @@ TEST_F(ClientTest, TestInsertIgnore) {
   {
     unique_ptr<KuduInsert> insert(BuildTestInsert(client_table_.get(), 1));
     ASSERT_OK(session->Apply(insert.release()));
-    DoTestInsertIgnoreVerifyRows(client_table_, 1);
+    DoTestVerifyRows(client_table_, 1);
   }
 
   {
-    // INSERT IGNORE results in no error on duplicate primary key
+    // INSERT IGNORE results in no error on duplicate primary key.
     unique_ptr<KuduInsertIgnore> insert_ignore(BuildTestInsertIgnore(client_table_.get(), 1));
     ASSERT_OK(session->Apply(insert_ignore.release()));
-    DoTestInsertIgnoreVerifyRows(client_table_, 1);
+    DoTestVerifyRows(client_table_, 1);
   }
 
   {
-    // INSERT IGNORE cannot update row
+    // INSERT IGNORE cannot update row.
     unique_ptr<KuduInsertIgnore> insert_ignore(client_table_->NewInsertIgnore());
     ASSERT_OK(insert_ignore->mutable_row()->SetInt32("key", 1));
     ASSERT_OK(insert_ignore->mutable_row()->SetInt32("int_val", 999));
     ASSERT_OK(insert_ignore->mutable_row()->SetStringCopy("string_val", "hello world"));
     ASSERT_OK(insert_ignore->mutable_row()->SetInt32("non_null_with_default", 999));
     ASSERT_OK(session->Apply(insert_ignore.release())); // returns ok but results in no change
-    DoTestInsertIgnoreVerifyRows(client_table_, 1);
+    DoTestVerifyRows(client_table_, 1);
   }
 
   {
-    // INSERT IGNORE can insert new row
+    // INSERT IGNORE can insert new row.
     unique_ptr<KuduInsertIgnore> insert_ignore(BuildTestInsertIgnore(client_table_.get(), 2));
     ASSERT_OK(session->Apply(insert_ignore.release()));
-    DoTestInsertIgnoreVerifyRows(client_table_, 2);
+    DoTestVerifyRows(client_table_, 2);
+  }
+}
+
+TEST_F(ClientTest, TestUpdateIgnore) {
+  shared_ptr<KuduSession> session = client_->NewSession();
+  session->SetTimeoutMillis(10000);
+  ASSERT_OK(session->SetFlushMode(KuduSession::AUTO_FLUSH_SYNC));
+
+  {
+    // UPDATE IGNORE results in no error on missing primary key.
+    unique_ptr<KuduUpdateIgnore> update_ignore(BuildTestUpdateIgnore(client_table_.get(), 1));
+    ASSERT_OK(session->Apply(update_ignore.release()));
+    DoTestVerifyRows(client_table_, 0);
+  }
+
+  {
+    unique_ptr<KuduInsert> insert(BuildTestInsert(client_table_.get(), 1));
+    ASSERT_OK(session->Apply(insert.release()));
+    DoTestVerifyRows(client_table_, 1);
+  }
+
+  {
+    // UPDATE IGNORE can update row.
+    unique_ptr<KuduUpdateIgnore> update_ignore(client_table_->NewUpdateIgnore());
+    ASSERT_OK(update_ignore->mutable_row()->SetInt32("key", 1));
+    ASSERT_OK(update_ignore->mutable_row()->SetInt32("int_val", 999));
+    ASSERT_OK(update_ignore->mutable_row()->SetStringCopy("string_val", "hello world"));
+    ASSERT_OK(update_ignore->mutable_row()->SetInt32("non_null_with_default", 999));
+    ASSERT_OK(session->Apply(update_ignore.release()));
+
+    vector<string> rows;
+    KuduScanner scanner(client_table_.get());
+    ASSERT_OK(ScanToStrings(&scanner, &rows));
+    ASSERT_EQ(1, rows.size());
+    ASSERT_EQ("(int32 key=1, int32 int_val=999, string string_val=\"hello world\", "
+              "int32 non_null_with_default=999)", rows[0]);
+  }
+}
+
+TEST_F(ClientTest, TestDeleteIgnore) {
+  shared_ptr<KuduSession> session = client_->NewSession();
+  session->SetTimeoutMillis(10000);
+  ASSERT_OK(session->SetFlushMode(KuduSession::AUTO_FLUSH_SYNC));
+
+  {
+    unique_ptr<KuduInsert> insert(BuildTestInsert(client_table_.get(), 1));
+    ASSERT_OK(session->Apply(insert.release()));
+    DoTestVerifyRows(client_table_, 1);
+  }
+
+  {
+    // DELETE IGNORE can delete row.
+    unique_ptr<KuduDeleteIgnore> delete_ignore(BuildTestDeleteIgnore(client_table_.get(), 1));
+    ASSERT_OK(session->Apply(delete_ignore.release()));
+    DoTestVerifyRows(client_table_, 0);
+  }
+
+  {
+    // DELETE IGNORE results in no error on missing primary key.
+    unique_ptr<KuduDeleteIgnore> delete_ignore(BuildTestDeleteIgnore(client_table_.get(), 1));
+    ASSERT_OK(session->Apply(delete_ignore.release()));
+    DoTestVerifyRows(client_table_, 0);
   }
 }
 
@@ -6414,6 +6552,54 @@ TEST_F(ClientTest, TestRetrieveAuthzTokenInParallel) {
   LOG(INFO) << Substitute("$0 concurrent threads sent $1 RPC(s) to get authz tokens",
                           kThreads, num_reqs);
   ASSERT_LT(num_reqs, kThreads);
+}
+
+// This is test verifies that txn_id is properly set in a transactional session
+// and its current batcher. This is a unit-level test scenario.
+TEST_F(ClientTest, TxnIdOfTransactionalSession) {
+  const auto apply_single_insert = [this] (KuduSession* s) {
+    ASSERT_OK(s->SetFlushMode(KuduSession::MANUAL_FLUSH));
+    unique_ptr<KuduInsert> insert(client_table_->NewInsert());
+    ASSERT_OK(insert->mutable_row()->SetInt32("key", 0));
+    ASSERT_OK(insert->mutable_row()->SetInt32("int_val", 0));
+    ASSERT_OK(s->Apply(insert.release()));
+  };
+
+  // Check how relevant member fields are populated in case of
+  // non-transactional session.
+  {
+    KuduSession s(client_);
+
+    const auto& session_data_txn_id = s.data_->txn_id_;
+    ASSERT_FALSE(session_data_txn_id.IsValid());
+
+    NO_FATALS(apply_single_insert(&s));
+
+    // Make sure current batcher has txn_id_ set to an non-valid transaction
+    // identifier.
+    ASSERT_NE(nullptr, s.data_->batcher_.get());
+    const auto& batcher_txn_id = s.data_->batcher_->txn_id();
+    ASSERT_FALSE(batcher_txn_id.IsValid());
+  }
+
+  // Check how relevant member fields are populated in case of
+  // transactional session.
+  {
+    const TxnId kTxnId(0);
+    KuduSession s(client_, kTxnId);
+
+    const auto& session_data_txn_id = s.data_->txn_id_;
+    ASSERT_TRUE(session_data_txn_id.IsValid());
+    ASSERT_EQ(kTxnId.value(), session_data_txn_id.value());
+
+    NO_FATALS(apply_single_insert(&s));
+
+    // Make sure current batcher has txn_id_ member properly set.
+    ASSERT_NE(nullptr, s.data_->batcher_.get());
+    const auto& batcher_txn_id = s.data_->batcher_->txn_id();
+    ASSERT_TRUE(batcher_txn_id.IsValid());
+    ASSERT_EQ(kTxnId.value(), batcher_txn_id.value());
+  }
 }
 
 // This test verifies that rows with column schema violations such as

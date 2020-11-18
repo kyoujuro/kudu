@@ -120,7 +120,8 @@ void CheckInvalidAuthzToken(const Status& s, const RpcController& rpc) {
 TokenSigningPrivateKeyPB GetTokenSigningPrivateKey(int seq_num) {
   TokenSigningPrivateKeyPB tsk;
   PrivateKey private_key;
-  CHECK_OK(GeneratePrivateKey(/*num_bits=*/512, &private_key));
+  int key_size = UseLargeKeys() ? 2048 : 512;
+  CHECK_OK(GeneratePrivateKey(key_size, &private_key));
   string private_key_str_der;
   CHECK_OK(private_key.ToString(&private_key_str_der, security::DataFormat::DER));
   tsk.set_rsa_key_der(private_key_str_der);
@@ -1191,6 +1192,9 @@ class WritePrivilegeAuthzTest : public AuthzTabletServerTestBase {
       RowOperationsPB::INSERT,
       RowOperationsPB::UPDATE,
       RowOperationsPB::UPSERT,
+      RowOperationsPB::INSERT_IGNORE,
+      RowOperationsPB::UPDATE_IGNORE,
+      RowOperationsPB::DELETE_IGNORE,
     };
     RowOpTypes types;
     types.reset(SelectRandomSubset<
@@ -1226,7 +1230,19 @@ TEST_F(WritePrivilegeAuthzTest, TestSingleWriteOperations) {
   }
   {
     vector<WriteOpDescriptor> batch({
+      { RowOperationsPB::INSERT_IGNORE, /*key=*/0, /*val=*/0 }
+    });
+    NO_FATALS(CheckWritePrivileges(batch, WritePrivileges{ WritePrivilegeType::INSERT }));
+  }
+  {
+    vector<WriteOpDescriptor> batch({
       { RowOperationsPB::UPDATE, /*key=*/0, /*val=*/1234 }
+    });
+    NO_FATALS(CheckWritePrivileges(batch, WritePrivileges{ WritePrivilegeType::UPDATE }));
+  }
+  {
+    vector<WriteOpDescriptor> batch({
+      { RowOperationsPB::UPDATE_IGNORE, /*key=*/0, /*val=*/1234 }
     });
     NO_FATALS(CheckWritePrivileges(batch, WritePrivileges{ WritePrivilegeType::UPDATE }));
   }
@@ -1240,6 +1256,12 @@ TEST_F(WritePrivilegeAuthzTest, TestSingleWriteOperations) {
   {
     vector<WriteOpDescriptor> batch({
       { RowOperationsPB::DELETE, /*key=*/0, /*val=*/0 }
+    });
+    NO_FATALS(CheckWritePrivileges(batch, WritePrivileges{ WritePrivilegeType::DELETE }));
+  }
+  {
+    vector<WriteOpDescriptor> batch({
+      { RowOperationsPB::DELETE_IGNORE, /*key=*/0, /*val=*/0 }
     });
     NO_FATALS(CheckWritePrivileges(batch, WritePrivileges{ WritePrivilegeType::DELETE }));
   }

@@ -115,13 +115,17 @@ message ServerEntryPB {
   optional NodeInstancePB instance_id = 2;
   optional ServerRegistrationPB registration = 3;
 
-  // If an error has occured earlier in the RPC call, the role
+  // If an error has occurred earlier in the RPC call, the role
   // may be not be set.
   optional consensus.RaftPeerPB.Role role = 4;
 
   // The unique cluster ID of the cluster this server belongs too.
   // TODO(ghenke): Currently only set for masters.
   optional string cluster_id = 5;
+
+  // If an error has occurred earlier in the RPC call, the
+  // member_type may not be set.
+  optional consensus.RaftPeerPB.MemberType member_type = 6;
 }
 
 // A row block in which each row is stored contiguously.
@@ -191,6 +195,8 @@ message RowOperationsPB {
     DELETE = 3;
     UPSERT = 5;
     INSERT_IGNORE = 10;
+    UPDATE_IGNORE = 11;
+    DELETE_IGNORE = 12;
 
     // Used when specifying split rows on table creation.
     SPLIT_ROW = 4;
